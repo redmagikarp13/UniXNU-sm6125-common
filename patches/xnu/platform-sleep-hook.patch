@@ -1,0 +1,12 @@
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -1020,6 +1020,9 @@ cpu_cluster_id(void)
+ 	return getCpuDatap()->cpu_cluster_id;
+ }
+ 
++/* Placeholder para o weak_import do ArmCpu no ld-prime (Xcode 27); platform-sleep não está habilitado no SM6125. */
++void (*arm64_platform_sleep_hook)(boolean_t boot_cpu) = NULL;
++
+ __attribute__((noreturn))
+ void
+ ml_arm_sleep(void)

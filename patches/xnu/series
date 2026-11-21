@@ -3,3 +3,4 @@
 # sheng-platform-power: bloco #if XNU_SHENG_PMGR em bsd_init.c exigido como contexto por zzz-boot-progress.patch (compila vazio com XNU_SHENG_PMGR=0)
 arch:../../../patches/xnu/native-smp-secondary.patch
 arch:../../../patches/xnu/sheng-platform-power.patch
+platform-sleep-hook.patch
