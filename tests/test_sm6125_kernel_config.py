@@ -286,9 +286,12 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         self.assertIn('_sm6125_emmc_fast_bench_run', names)
         self.assertIn('_sm6125_emmc_ctrl_init', names)
         self.assertIn('_sm6125_emmc_ctrl_read_sectors', names)
+        self.assertIn('_sm6125_emmc_ctrl_write_sectors', names)
+        self.assertIn('_sm6125_emmc_ctrl_flush_cache', names)
         self.assertIn('_sm6125_shngroot_parse', names)
         self.assertIn('_sm6125_emmc_block_late_init', names)
         self.assertIn('_sm6125_emmc_post_mount_check', names)
+        self.assertIn('_sm6125_emmc_post_data_mount_check', names)
         self.assertIn('_vr_open', names)
         self.assertIn('_vr_open_header', names)
         self.assertIn('_vr_verify_block', names)
@@ -297,11 +300,18 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         self.assertIn('_native_verified_block_manifest_sha384', names)
         self.assertIn('_native_verified_block_volume_device', names)
         self.assertIn('_native_owner_publish_boot_manifest', names)
+        self.assertIn('_native_ufs_store_open', names)
+        self.assertIn('_native_ufs_store_write_cached', names)
+        self.assertIn('_native_ufs_store_sync', names)
         self.assertIn('__ZTV15Sm6125EmmcBlock', names)
+        self.assertIn('__ZTV14NativeRamBlock', names)
         board_toml = tomllib.loads(BOARD_TOML_PATH.read_text(encoding='utf-8'))
         self.assertEqual(
             board_toml.get('payload', {}).get('adt', {}).get('root_match_volume_uuid'),
             '04769D26-2CA0-4825-B443-E2E5F88300F2',
+        )
+        self.assertTrue(
+            board_toml.get('payload', {}).get('adt', {}).get('packed_data_ramdisk'),
         )
         bsd_init_disasm = _disassemble_symbol(kernel_path, '_bsd_init', addrs=addrs)
         self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_sm6125_emmc_probe_run>')

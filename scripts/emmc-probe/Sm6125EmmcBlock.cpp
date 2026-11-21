@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Driver de bloco somente-leitura IOBlockStorageDevice para eMMC SM6125 (SDCC1 DDR52 + 32-bit ADMA2 + VerifiedRoot).
+// Driver de bloco somente-leitura IOBlockStorageDevice para eMMC SM6125 (SDCC1
+// DDR52 + 32-bit ADMA2 + VerifiedRoot).
 #include "Sm6125EmmcCore.h"
 #include "Sm6125EmmcReadOnly.h"
 #include "Sm6125ShngRoot.h"
@@ -32,6 +33,12 @@
 #include <vm/vm_kern.h>
 #include <vm/vm_map.h>
 
+extern "C" bool ml_static_mfree_prepare(vm_offset_t, vm_size_t)
+    __attribute__((weak));
+extern "C" bool ml_static_mfree_prepare(vm_offset_t, vm_size_t) {
+  return false;
+}
+
 extern "C" {
 
 extern kmod_info_t g_kernel_kmod_info;
@@ -41,9 +48,11 @@ extern const struct vr_crypto vr_xnu_crypto;
 extern const uint8_t sm6125_verified_root_key[VR_KEY_BYTES];
 extern const size_t sm6125_verified_root_key_len;
 extern const uint64_t sm6125_verified_root_min_generation;
-extern const uint8_t sm6125_verified_os_header[VR_HEADER_BYTES + VR_SIGNATURE_BYTES];
+extern const uint8_t
+    sm6125_verified_os_header[VR_HEADER_BYTES + VR_SIGNATURE_BYTES];
 extern const size_t sm6125_verified_os_header_len;
-extern const uint8_t sm6125_verified_systemos_header[VR_HEADER_BYTES + VR_SIGNATURE_BYTES];
+extern const uint8_t
+    sm6125_verified_systemos_header[VR_HEADER_BYTES + VR_SIGNATURE_BYTES];
 extern const size_t sm6125_verified_systemos_header_len;
 
 extern volatile int native_owner_root_accepted;
@@ -56,9 +65,47 @@ extern volatile int native_owner_boot_manifest_status;
 extern uint8_t native_owner_boot_manifest_hash[48];
 
 int native_verified_block_root_authorized(dev_t device);
-int native_verified_block_manifest_sha384(dev_t device, const char *uuid, uint8_t digest[48]);
-int native_verified_block_volume_device(const char *uuid, dev_t *device, char *path, size_t size);
-void sm6125_emmc_post_mount_check(int cache_error, int launchd_ok, int dyld_ok, int dsc_ok);
+int native_verified_block_manifest_sha384(dev_t device, const char *uuid,
+                                          uint8_t digest[48]);
+int native_verified_block_volume_device(const char *uuid, dev_t *device,
+                                        char *path, size_t size);
+void sm6125_emmc_post_mount_check(int cache_error, int launchd_ok, int dyld_ok,
+                                  int dsc_ok);
+void sm6125_emmc_post_data_mount_check(int data_error, int vfs_err,
+                                       uint32_t prev_boot, uint32_t cur_boot,
+                                       int readback_ok);
+
+unsigned native_ufs_store_mode(void);
+int native_ufs_store_open(uint64_t blocks_4k, uint64_t *first_lba,
+                          const char **why);
+int native_ufs_store_read(uint64_t block_4k, uint32_t count_4k, void *dst);
+int native_ufs_store_write(uint64_t block_4k, uint32_t count_4k,
+                           const void *src);
+int native_ufs_store_write_cached(uint64_t block_4k, uint32_t count_4k,
+                                  const void *src);
+int native_ufs_store_sync(void);
+unsigned native_ufs_store_gpt_check(void);
+
+extern volatile uint32_t native_ram_block_ready;
+extern volatile uint32_t native_data_persist_state;
+extern volatile uint32_t native_data_persist_header;
+extern volatile uint32_t native_data_persist_gpt;
+extern volatile uint32_t native_data_persist_gpt_after;
+extern volatile uint32_t native_data_write_back;
+extern volatile uint64_t native_data_persist_pages;
+extern volatile uint64_t native_data_persist_loaded;
+extern volatile uint64_t native_data_persist_writes;
+extern volatile uint64_t native_data_persist_syncs;
+extern volatile uint64_t native_data_persist_errors;
+extern volatile uint64_t native_data_persist_first_lba;
+extern volatile uint64_t native_data_persist_present;
+extern volatile uint64_t native_data_flushes;
+extern volatile uint64_t native_data_flush_blocks;
+
+extern volatile int native_owner_data_status;
+extern volatile int native_owner_data_stage;
+extern volatile int native_owner_data_readonly;
+extern char native_owner_data_device_path[64];
 
 uint8_t sm6125_mmio_read8(uintptr_t base, uint32_t offset);
 uint16_t sm6125_mmio_read16(uintptr_t base, uint32_t offset);
@@ -67,19 +114,20 @@ void sm6125_mmio_write8(uintptr_t base, uint32_t offset, uint8_t value);
 void sm6125_mmio_write16(uintptr_t base, uint32_t offset, uint16_t value);
 void sm6125_mmio_write32(uintptr_t base, uint32_t offset, uint32_t value);
 
-void sm6125_ioblockstoragedevice_static_init(void)
-    __asm__("__GLOBAL__sub_I_IOBlockStorageDevice.cpp");
-void sm6125_emmc_block_static_init(void)
-    __asm__("__GLOBAL__sub_I_Sm6125EmmcBlock.cpp");
+void sm6125_ioblockstoragedevice_static_init(void) __asm__(
+    "__GLOBAL__sub_I_IOBlockStorageDevice.cpp");
+void sm6125_emmc_block_static_init(void) __asm__(
+    "__GLOBAL__sub_I_Sm6125EmmcBlock.cpp");
+void sm6125_native_ram_block_static_init(void) __asm__(
+    "__GLOBAL__sub_I_NativeRamBlock.cpp");
 
 static const OSMetaClass *g_sm6125_storage_parent = nullptr;
 
-const OSMetaClass *sm6125_emmc_storage_parent(void)
-{
+const OSMetaClass *sm6125_emmc_storage_parent(void) {
   return g_sm6125_storage_parent;
 }
 
-}  // extern "C"
+} // extern "C"
 
 namespace {
 
@@ -89,21 +137,29 @@ constexpr size_t kDmaCanaryBytes = 4096u;
 constexpr size_t kDmaDataTotal = kBounceBufBytes + kDmaCanaryBytes;
 constexpr char kOsVolumeUuid[] = "04769D26-2CA0-4825-B443-E2E5F88300F2";
 constexpr char kSystemOsVolumeUuid[] = "8846FE78-2910-4297-AF97-D59BB6F8FC16";
+constexpr char kDataVolumeUuid[] = "F8186F89-F2EA-49D2-AA2E-80FD4A75053F";
 
-static void blk_delay_us(uint32_t microseconds)
-{
-  IODelay(microseconds);
+static uint32_t blk_crc32_le(const uint8_t *data, size_t len) {
+  uint32_t crc = 0xFFFFFFFFu;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (unsigned b = 0; b < 8u; ++b) {
+      crc = (crc & 1u) ? ((crc >> 1u) ^ 0xEDB88320u) : (crc >> 1u);
+    }
+  }
+  return ~crc;
 }
 
-static uint64_t blk_now_us(void)
-{
+static void blk_delay_us(uint32_t microseconds) { IODelay(microseconds); }
+
+static uint64_t blk_now_us(void) {
   uint64_t ns = 0;
   absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
   return ns / 1000ULL;
 }
 
-static void blk_sha256(const uint8_t *data, size_t len, uint8_t out_digest[32])
-{
+static void blk_sha256(const uint8_t *data, size_t len,
+                       uint8_t out_digest[32]) {
   SHA256_CTX ctx;
   SHA256_Init(&ctx);
   SHA256_Update(&ctx, data, len);
@@ -141,13 +197,24 @@ struct Sm6125SharedEmmcCtrl {
   volatile uint64_t io_time_us;
   char os_bsd[16];
   char sysos_bsd[16];
+  bool persist_enabled;
+  bool persist_window_open;
+  bool ram_started;
+  uint64_t store_first_lba;
+  uint64_t store_blocks_4k;
+  uint32_t init_gpt_hdr_crc;
+  uint32_t init_gpt_parts_crc;
+  bool root_check_valid;
+  int root_cache_err;
+  int root_launchd_ok;
+  int root_dyld_ok;
+  int root_dsc_ok;
 };
 
 static Sm6125SharedEmmcCtrl *g_shared_ctrl = nullptr;
 static bool g_classes_registered = false;
 
-static void shared_clean_desc(void *ctx, size_t offset, size_t len)
-{
+static void shared_clean_desc(void *ctx, size_t offset, size_t len) {
   auto *c = static_cast<Sm6125SharedEmmcCtrl *>(ctx);
   if (c && c->desc_md) {
     c->desc_md->performOperation(kIOMemoryIncoherentIOStore, offset, len);
@@ -155,8 +222,7 @@ static void shared_clean_desc(void *ctx, size_t offset, size_t len)
   }
 }
 
-static void shared_flush_data(void *ctx, size_t offset, size_t len)
-{
+static void shared_flush_data(void *ctx, size_t offset, size_t len) {
   auto *c = static_cast<Sm6125SharedEmmcCtrl *>(ctx);
   if (c && c->data_md) {
     c->data_md->performOperation(kIOMemoryIncoherentIOFlush, offset, len);
@@ -164,8 +230,7 @@ static void shared_flush_data(void *ctx, size_t offset, size_t len)
   }
 }
 
-static void shared_invalidate_data(void *ctx, size_t offset, size_t len)
-{
+static void shared_invalidate_data(void *ctx, size_t offset, size_t len) {
   auto *c = static_cast<Sm6125SharedEmmcCtrl *>(ctx);
   if (c && c->data_md) {
     c->data_md->performOperation(kIOMemoryIncoherentIOFlush, offset, len);
@@ -173,16 +238,15 @@ static void shared_invalidate_data(void *ctx, size_t offset, size_t len)
   }
 }
 
-static const OSMetaClass *lookup_meta(const char *name_cstr)
-{
+static const OSMetaClass *lookup_meta(const char *name_cstr) {
   const OSSymbol *sym = OSSymbol::withCString(name_cstr);
-  const OSMetaClass *meta = sym ? OSMetaClass::getMetaClassWithName(sym) : nullptr;
+  const OSMetaClass *meta =
+      sym ? OSMetaClass::getMetaClassWithName(sym) : nullptr;
   OSSafeReleaseNULL(sym);
   return meta;
 }
 
-static bool dt_compatible_has(IORegistryEntry *entry, const char *target)
-{
+static bool dt_compatible_has(IORegistryEntry *entry, const char *target) {
   OSData *compat = OSDynamicCast(OSData, entry->getProperty("compatible"));
   if (!compat || !compat->getLength()) {
     return false;
@@ -196,7 +260,8 @@ static bool dt_compatible_has(IORegistryEntry *entry, const char *target)
     while (end < len && bytes[end] != '\0') {
       end++;
     }
-    if (end < len && (end - pos) == target_len && memcmp(bytes + pos, target, target_len) == 0) {
+    if (end < len && (end - pos) == target_len &&
+        memcmp(bytes + pos, target, target_len) == 0) {
       return true;
     }
     pos = end + 1;
@@ -204,15 +269,16 @@ static bool dt_compatible_has(IORegistryEntry *entry, const char *target)
   return false;
 }
 
-static bool read_dt_geometry(uint64_t *out_gcc_pa, uint64_t *out_sdhci_pa)
-{
+static bool read_dt_geometry(uint64_t *out_gcc_pa, uint64_t *out_sdhci_pa) {
   IORegistryEntry *soc = IORegistryEntry::fromPath("/arm-io", gIODTPlane);
   IORegistryEntry *gcc = IORegistryEntry::fromPath("/arm-io/gcc", gIODTPlane);
-  IORegistryEntry *sdhci = IORegistryEntry::fromPath("/arm-io/sdhci1", gIODTPlane);
+  IORegistryEntry *sdhci =
+      IORegistryEntry::fromPath("/arm-io/sdhci1", gIODTPlane);
   bool ok = false;
 
   if (soc && gcc && sdhci &&
-      (dt_compatible_has(gcc, "qcom,gcc-sm6125") || dt_compatible_has(gcc, "qcom,gcc-trinket")) &&
+      (dt_compatible_has(gcc, "qcom,gcc-sm6125") ||
+       dt_compatible_has(gcc, "qcom,gcc-trinket")) &&
       dt_compatible_has(sdhci, "qcom,sdhci-msm-v5")) {
     OSData *ranges = OSDynamicCast(OSData, soc->getProperty("ranges"));
     OSData *gcc_reg = OSDynamicCast(OSData, gcc->getProperty("reg"));
@@ -220,16 +286,18 @@ static bool read_dt_geometry(uint64_t *out_gcc_pa, uint64_t *out_sdhci_pa)
     uint64_t bus[3] = {0, 0, 0};
     uint64_t gcc_pair[2] = {0, 0};
     uint64_t sdhci_pair[2] = {0, 0};
-    if (ranges && ranges->getLength() == sizeof(bus) &&
-        gcc_reg && gcc_reg->getLength() >= sizeof(gcc_pair) &&
-        sdhci_reg && sdhci_reg->getLength() >= sizeof(sdhci_pair)) {
+    if (ranges && ranges->getLength() == sizeof(bus) && gcc_reg &&
+        gcc_reg->getLength() >= sizeof(gcc_pair) && sdhci_reg &&
+        sdhci_reg->getLength() >= sizeof(sdhci_pair)) {
       memcpy(bus, ranges->getBytesNoCopy(), sizeof(bus));
       memcpy(gcc_pair, gcc_reg->getBytesNoCopy(), sizeof(gcc_pair));
       memcpy(sdhci_pair, sdhci_reg->getBytesNoCopy(), sizeof(sdhci_pair));
-      ok = sm6125_emmc_translate_region(
-               bus, gcc_pair[0], gcc_pair[1], SM6125_GCC_MIN_REGION_SIZE, out_gcc_pa) &&
-           sm6125_emmc_translate_region(
-               bus, sdhci_pair[0], sdhci_pair[1], SM6125_SDHCI_MIN_REGION_SIZE, out_sdhci_pa);
+      ok = sm6125_emmc_translate_region(bus, gcc_pair[0], gcc_pair[1],
+                                        SM6125_GCC_MIN_REGION_SIZE,
+                                        out_gcc_pa) &&
+           sm6125_emmc_translate_region(bus, sdhci_pair[0], sdhci_pair[1],
+                                        SM6125_SDHCI_MIN_REGION_SIZE,
+                                        out_sdhci_pa);
     }
   }
 
@@ -239,14 +307,11 @@ static bool read_dt_geometry(uint64_t *out_gcc_pa, uint64_t *out_sdhci_pa)
   return ok;
 }
 
-static bool map_mmio_window(
-    uint64_t phys_addr,
-    uint64_t length,
-    IOMemoryDescriptor **out_desc,
-    IOMemoryMap **out_map)
-{
-  IOMemoryDescriptor *desc =
-      IOMemoryDescriptor::withPhysicalAddress(phys_addr, length, kIODirectionInOut);
+static bool map_mmio_window(uint64_t phys_addr, uint64_t length,
+                            IOMemoryDescriptor **out_desc,
+                            IOMemoryMap **out_map) {
+  IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(
+      phys_addr, length, kIODirectionInOut);
   if (!desc) {
     return false;
   }
@@ -261,17 +326,19 @@ static bool map_mmio_window(
   return true;
 }
 
-static bool alloc_ctrl_dma(Sm6125SharedEmmcCtrl *ctrl, sm6125_emmc_dma_buf_t *out_dma)
-{
+static bool alloc_ctrl_dma(Sm6125SharedEmmcCtrl *ctrl,
+                           sm6125_emmc_dma_buf_t *out_dma) {
   constexpr mach_vm_address_t kLow4GMask = 0x00000000FFFFF000ULL;
   constexpr IOOptionBits kOpts =
       static_cast<IOOptionBits>(kIODirectionInOut) |
       static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous);
 
-  IOBufferMemoryDescriptor *desc_md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-      kernel_task, kOpts, kDmaDescBytes, kLow4GMask);
-  IOBufferMemoryDescriptor *data_md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-      kernel_task, kOpts, kDmaDataTotal, kLow4GMask);
+  IOBufferMemoryDescriptor *desc_md =
+      IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+          kernel_task, kOpts, kDmaDescBytes, kLow4GMask);
+  IOBufferMemoryDescriptor *data_md =
+      IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+          kernel_task, kOpts, kDmaDataTotal, kLow4GMask);
   if (!desc_md || !data_md) {
     OSSafeReleaseNULL(data_md);
     OSSafeReleaseNULL(desc_md);
@@ -291,8 +358,10 @@ static bool alloc_ctrl_dma(Sm6125SharedEmmcCtrl *ctrl, sm6125_emmc_dma_buf_t *ou
 
   IOByteCount desc_seg = 0;
   IOByteCount data_seg = 0;
-  const addr64_t desc_pa = desc_md->getPhysicalSegment(0, &desc_seg, kIOMemoryMapperNone);
-  const addr64_t data_pa = data_md->getPhysicalSegment(0, &data_seg, kIOMemoryMapperNone);
+  const addr64_t desc_pa =
+      desc_md->getPhysicalSegment(0, &desc_seg, kIOMemoryMapperNone);
+  const addr64_t data_pa =
+      data_md->getPhysicalSegment(0, &data_seg, kIOMemoryMapperNone);
   auto *desc_va = static_cast<uint8_t *>(desc_md->getBytesNoCopy());
   auto *data_va = static_cast<uint8_t *>(data_md->getBytesNoCopy());
   if (!desc_va || !data_va || !desc_pa || !data_pa ||
@@ -324,11 +393,9 @@ static bool alloc_ctrl_dma(Sm6125SharedEmmcCtrl *ctrl, sm6125_emmc_dma_buf_t *ou
   return true;
 }
 
-static bool select_window_policy_header(
-    const char *window_name,
-    const uint8_t **out_hdr,
-    size_t *out_hdr_len)
-{
+static bool select_window_policy_header(const char *window_name,
+                                        const uint8_t **out_hdr,
+                                        size_t *out_hdr_len) {
   if (!window_name || !out_hdr || !out_hdr_len) {
     return false;
   }
@@ -345,13 +412,12 @@ static bool select_window_policy_header(
   return false;
 }
 
-}  // namespace
+} // namespace
 
 class Sm6125EmmcBlock : public IOBlockStorageDevice {
-  OSDeclareDefaultStructors(Sm6125EmmcBlock)
+OSDeclareDefaultStructors(Sm6125EmmcBlock)
 
- private:
-  Sm6125SharedEmmcCtrl *ctrl_ = nullptr;
+    private : Sm6125SharedEmmcCtrl *ctrl_ = nullptr;
   uint64_t baseLba_ = 0;
   uint64_t sectorCount_ = 0;
   bool online_ = false;
@@ -364,14 +430,10 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
   char windowName_[32] = {};
   char productName_[48] = {};
 
- public:
-  bool configureWindow(
-      Sm6125SharedEmmcCtrl *ctrl,
-      const char *name,
-      uint64_t base_lba,
-      uint64_t sector_count,
-      bool require_verified)
-  {
+public:
+  bool configureWindow(Sm6125SharedEmmcCtrl *ctrl, const char *name,
+                       uint64_t base_lba, uint64_t sector_count,
+                       bool require_verified) {
     if (!ctrl || !ctrl->core.online || !name || sector_count == 0 ||
         base_lba >= ctrl->core.sec_count ||
         sector_count > ctrl->core.sec_count - base_lba) {
@@ -390,11 +452,9 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     return true;
   }
 
-  bool configureVerifiedWindow(
-      Sm6125SharedEmmcCtrl *ctrl,
-      const sm6125_shngroot_entry_t &win_entry,
-      const sm6125_shngroot_entry_t *vroot_entry)
-  {
+  bool configureVerifiedWindow(Sm6125SharedEmmcCtrl *ctrl,
+                               const sm6125_shngroot_entry_t &win_entry,
+                               const sm6125_shngroot_entry_t *vroot_entry) {
     if (!ctrl || !vroot_entry ||
         win_entry.flags != SM6125_SHNGROOT_FLAG_RO_WINDOW ||
         vroot_entry->flags != SM6125_SHNGROOT_FLAG_OBJECT ||
@@ -404,7 +464,8 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
         (vroot_entry->offset & 511ULL) != 0ULL) {
       return false;
     }
-    const uint64_t win_base = ctrl->core.userdata_first + (win_entry.offset / 512ULL);
+    const uint64_t win_base =
+        ctrl->core.userdata_first + (win_entry.offset / 512ULL);
     const uint64_t win_secs = win_entry.size / 512ULL;
     if (!configureWindow(ctrl, win_entry.name, win_base, win_secs, true)) {
       return false;
@@ -419,13 +480,9 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     }
 
     vr_view hdr_view = {};
-    if (vr_open_header(
-            hdr,
-            hdr_len,
-            sm6125_verified_root_key,
-            sm6125_verified_root_min_generation,
-            &vr_xnu_crypto,
-            &hdr_view) != VR_OK) {
+    if (vr_open_header(hdr, hdr_len, sm6125_verified_root_key,
+                       sm6125_verified_root_min_generation, &vr_xnu_crypto,
+                       &hdr_view) != VR_OK) {
       return false;
     }
 
@@ -436,16 +493,15 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
       return false;
     }
 
-    const size_t envelope_bytes = hdr_len + static_cast<size_t>(vroot_entry->size);
-    const vm_size_t table_pages = round_page(static_cast<vm_size_t>(envelope_bytes));
+    const size_t envelope_bytes =
+        hdr_len + static_cast<size_t>(vroot_entry->size);
+    const vm_size_t table_pages =
+        round_page(static_cast<vm_size_t>(envelope_bytes));
     const vm_size_t alloc_bytes = table_pages + PAGE_SIZE;
     vm_offset_t storage = 0;
-    if (kmem_alloc(
-            kernel_map,
-            &storage,
-            alloc_bytes,
-            static_cast<kma_flags_t>(KMA_KOBJECT | KMA_DATA),
-            VM_KERN_MEMORY_SECURITY) != KERN_SUCCESS ||
+    if (kmem_alloc(kernel_map, &storage, alloc_bytes,
+                   static_cast<kma_flags_t>(KMA_KOBJECT | KMA_DATA),
+                   VM_KERN_MEMORY_SECURITY) != KERN_SUCCESS ||
         !storage) {
       return false;
     }
@@ -453,7 +509,8 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     auto *storage_bytes = reinterpret_cast<uint8_t *>(storage);
     memcpy(storage_bytes, hdr, hdr_len);
 
-    const uint64_t vroot_base_lba = ctrl->core.userdata_first + (vroot_entry->offset / 512ULL);
+    const uint64_t vroot_base_lba =
+        ctrl->core.userdata_first + (vroot_entry->offset / 512ULL);
     const uint64_t total_vroot_bytes = vroot_entry->size;
     uint64_t copied_bytes = 0;
     uint64_t lba_cursor = vroot_base_lba;
@@ -462,7 +519,8 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     while (copied_bytes < total_vroot_bytes) {
       const uint64_t rem_bytes = total_vroot_bytes - copied_bytes;
       const uint64_t rem_sectors = (rem_bytes + 511ULL) / 512ULL;
-      const uint32_t chunk_sectors = static_cast<uint32_t>(rem_sectors > 64ULL ? 64ULL : rem_sectors);
+      const uint32_t chunk_sectors =
+          static_cast<uint32_t>(rem_sectors > 64ULL ? 64ULL : rem_sectors);
       const size_t copy_len = static_cast<size_t>(
           rem_bytes < static_cast<uint64_t>(chunk_sectors) * 512ULL
               ? rem_bytes
@@ -474,7 +532,8 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
         kmem_free(kernel_map, storage, alloc_bytes);
         return false;
       }
-      memcpy(storage_bytes + hdr_len + copied_bytes, ctrl->bounce_buf, copy_len);
+      memcpy(storage_bytes + hdr_len + copied_bytes, ctrl->bounce_buf,
+             copy_len);
       copied_bytes += copy_len;
       lba_cursor += chunk_sectors;
     }
@@ -483,34 +542,29 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     auto *key_copy = storage_bytes + table_pages;
     memcpy(key_copy, sm6125_verified_root_key, VR_KEY_BYTES);
 
-    if (vm_map_protect(
-            kernel_map,
-            storage,
-            storage + alloc_bytes,
-            VM_PROT_READ,
-            TRUE) != KERN_SUCCESS) {
+    if (vm_map_protect(kernel_map, storage, storage + alloc_bytes, VM_PROT_READ,
+                       TRUE) != KERN_SUCCESS) {
       kmem_free(kernel_map, storage, alloc_bytes);
       return false;
     }
 
     vr_view full_view = {};
-    if (vr_open(
-            storage_bytes,
-            envelope_bytes,
-            key_copy,
-            sm6125_verified_root_min_generation,
-            &vr_xnu_crypto,
-            &full_view) != VR_OK ||
+    if (vr_open(storage_bytes, envelope_bytes, key_copy,
+                sm6125_verified_root_min_generation, &vr_xnu_crypto,
+                &full_view) != VR_OK ||
         full_view.image_bytes != win_entry.size) {
       return false;
     }
 
-    /* Cryptographically verify block 0 (4 KiB = 8 sectors) before publishing the device. */
+    /* Cryptographically verify block 0 (4 KiB = 8 sectors) before publishing
+     * the device. */
     IOLockLock(ctrl->gate);
-    const int32_t b0_rc = sm6125_emmc_ctrl_read_sectors(&ctrl->core, win_base, 8u, ctrl->bounce_buf);
+    const int32_t b0_rc = sm6125_emmc_ctrl_read_sectors(&ctrl->core, win_base,
+                                                        8u, ctrl->bounce_buf);
     const int vr_b0 = (b0_rc == SM6125_EMMC_RC_OK)
-        ? vr_verify_block(&full_view, 0ULL, ctrl->bounce_buf, VR_BLOCK_BYTES, &vr_xnu_crypto)
-        : VR_BLOCK;
+                          ? vr_verify_block(&full_view, 0ULL, ctrl->bounce_buf,
+                                            VR_BLOCK_BYTES, &vr_xnu_crypto)
+                          : VR_BLOCK;
     IOLockUnlock(ctrl->gate);
     if (vr_b0 != VR_OK) {
       return false;
@@ -525,9 +579,9 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     return true;
   }
 
-  bool authenticatesVolume(const char *uuid, uint8_t *manifestDigest) const
-  {
-    if (!uuid || !online_ || !verifiedReady_ || !verifiedStorage_ || !verifiedView_.hashes) {
+  bool authenticatesVolume(const char *uuid, uint8_t *manifestDigest) const {
+    if (!uuid || !online_ || !verifiedReady_ || !verifiedStorage_ ||
+        !verifiedView_.hashes) {
       return false;
     }
     static const char kHex[] = "0123456789ABCDEF";
@@ -547,55 +601,43 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     if (manifestDigest) {
       SHA384_CTX ctx;
       SHA384_Init(&ctx);
-      SHA384_Update(
-          &ctx,
-          reinterpret_cast<const void *>(verifiedStorage_),
-          verifiedEnvelopeBytes_);
+      SHA384_Update(&ctx, reinterpret_cast<const void *>(verifiedStorage_),
+                    verifiedEnvelopeBytes_);
       SHA384_Final(manifestDigest, &ctx);
     }
     return true;
   }
 
-  IOReturn doEjectMedia(void) override
-  {
-    return kIOReturnUnsupported;
-  }
+  IOReturn doEjectMedia(void) override { return kIOReturnUnsupported; }
 
-  IOReturn doFormatMedia(UInt64 byteCapacity) override
-  {
+  IOReturn doFormatMedia(UInt64 byteCapacity) override {
     (void)byteCapacity;
     return kIOReturnNotWritable;
   }
 
-  UInt32 doGetFormatCapacities(UInt64 *capacities, UInt32 capacitiesMaxCount) const override
-  {
+  UInt32 doGetFormatCapacities(UInt64 *capacities,
+                               UInt32 capacitiesMaxCount) const override {
     (void)capacities;
     (void)capacitiesMaxCount;
     return 0;
   }
 
-  char *getVendorString(void) override
-  {
+  char *getVendorString(void) override {
     return const_cast<char *>("Qualcomm-Micron");
   }
 
-  char *getProductString(void) override
-  {
-    return productName_[0] ? productName_ : const_cast<char *>("SM6125 eMMC S0J9K8");
+  char *getProductString(void) override {
+    return productName_[0] ? productName_
+                           : const_cast<char *>("SM6125 eMMC S0J9K8");
   }
 
-  char *getRevisionString(void) override
-  {
-    return const_cast<char *>("1.0");
-  }
+  char *getRevisionString(void) override { return const_cast<char *>("1.0"); }
 
-  char *getAdditionalDeviceInfoString(void) override
-  {
+  char *getAdditionalDeviceInfoString(void) override {
     return const_cast<char *>("SDCC1 DDR52 ADMA2 VerifiedRoot RO");
   }
 
-  IOReturn reportBlockSize(UInt64 *blockSize) override
-  {
+  IOReturn reportBlockSize(UInt64 *blockSize) override {
     if (!blockSize) {
       return kIOReturnBadArgument;
     }
@@ -603,8 +645,7 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     return kIOReturnSuccess;
   }
 
-  IOReturn reportEjectability(bool *isEjectable) override
-  {
+  IOReturn reportEjectability(bool *isEjectable) override {
     if (!isEjectable) {
       return kIOReturnBadArgument;
     }
@@ -612,8 +653,7 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     return kIOReturnSuccess;
   }
 
-  IOReturn reportMaxValidBlock(UInt64 *maxBlock) override
-  {
+  IOReturn reportMaxValidBlock(UInt64 *maxBlock) override {
     if (!maxBlock || !online_ || sectorCount_ == 0) {
       return kIOReturnBadArgument;
     }
@@ -621,8 +661,7 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     return kIOReturnSuccess;
   }
 
-  IOReturn reportMediaState(bool *mediaPresent, bool *changedState) override
-  {
+  IOReturn reportMediaState(bool *mediaPresent, bool *changedState) override {
     if (!mediaPresent) {
       return kIOReturnBadArgument;
     }
@@ -633,8 +672,7 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     return kIOReturnSuccess;
   }
 
-  IOReturn reportRemovability(bool *isRemovable) override
-  {
+  IOReturn reportRemovability(bool *isRemovable) override {
     if (!isRemovable) {
       return kIOReturnBadArgument;
     }
@@ -642,8 +680,7 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     return kIOReturnSuccess;
   }
 
-  IOReturn reportWriteProtection(bool *isWriteProtected) override
-  {
+  IOReturn reportWriteProtection(bool *isWriteProtected) override {
     if (!isWriteProtected) {
       return kIOReturnBadArgument;
     }
@@ -651,21 +688,19 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     return kIOReturnSuccess;
   }
 
-  IOReturn doSynchronizeCache(void) override
-  {
+  IOReturn doSynchronizeCache(void) override {
     return online_ ? kIOReturnSuccess : kIOReturnNotReady;
   }
 
-  IOReturn doSynchronize(UInt64 block, UInt64 nblks, IOStorageSynchronizeOptions options) override
-  {
+  IOReturn doSynchronize(UInt64 block, UInt64 nblks,
+                         IOStorageSynchronizeOptions options) override {
     (void)block;
     (void)nblks;
     (void)options;
     return doSynchronizeCache();
   }
 
-  IOReturn getWriteCacheState(bool *enabled) override
-  {
+  IOReturn getWriteCacheState(bool *enabled) override {
     if (!enabled) {
       return kIOReturnBadArgument;
     }
@@ -673,22 +708,17 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     return kIOReturnSuccess;
   }
 
-  IOReturn setWriteCacheState(bool enabled) override
-  {
+  IOReturn setWriteCacheState(bool enabled) override {
     (void)enabled;
     return kIOReturnUnsupported;
   }
 
-  IOReturn doAsyncReadWrite(
-      IOMemoryDescriptor *buffer,
-      UInt64 block,
-      UInt64 nblks,
-      IOStorageAttributes *attributes,
-      IOStorageCompletion *completion) override
-  {
+  IOReturn doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block,
+                            UInt64 nblks, IOStorageAttributes *attributes,
+                            IOStorageCompletion *completion) override {
     (void)attributes;
-    if (!buffer || !completion || !completion->action || !nblks || !online_ || !ctrl_ ||
-        block >= sectorCount_ || nblks > sectorCount_ - block ||
+    if (!buffer || !completion || !completion->action || !nblks || !online_ ||
+        !ctrl_ || block >= sectorCount_ || nblks > sectorCount_ - block ||
         nblks > UINT64_MAX / 512ULL || buffer->getLength() < nblks * 512ULL) {
       return kIOReturnBadArgument;
     }
@@ -717,13 +747,15 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
         const uint64_t first_vr_blk = cur_byte / VR_BLOCK_BYTES;
         const uint64_t last_vr_blk = (end_byte - 1ULL) / VR_BLOCK_BYTES;
         uint64_t vr_blk_count = last_vr_blk - first_vr_blk + 1ULL;
-        constexpr uint64_t kMaxVrBlocksPerBatch = kBounceBufBytes / VR_BLOCK_BYTES;
+        constexpr uint64_t kMaxVrBlocksPerBatch =
+            kBounceBufBytes / VR_BLOCK_BYTES;
         if (vr_blk_count > kMaxVrBlocksPerBatch) {
           vr_blk_count = kMaxVrBlocksPerBatch;
         }
 
         const uint64_t batch_start_byte = first_vr_blk * VR_BLOCK_BYTES;
-        uint64_t batch_end_byte = batch_start_byte + vr_blk_count * VR_BLOCK_BYTES;
+        uint64_t batch_end_byte =
+            batch_start_byte + vr_blk_count * VR_BLOCK_BYTES;
         if (batch_end_byte > image_bytes) {
           batch_end_byte = image_bytes;
         }
@@ -731,8 +763,9 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
         const uint32_t batch_sectors =
             static_cast<uint32_t>((batch_end_byte - batch_start_byte) / 512ULL);
 
-        const int32_t rc = sm6125_emmc_ctrl_read_sectors(
-            &ctrl_->core, baseLba_ + batch_lba, batch_sectors, ctrl_->bounce_buf);
+        const int32_t rc =
+            sm6125_emmc_ctrl_read_sectors(&ctrl_->core, baseLba_ + batch_lba,
+                                          batch_sectors, ctrl_->bounce_buf);
         if (rc != SM6125_EMMC_RC_OK) {
           __atomic_fetch_add(&ctrl_->io_errors, 1u, __ATOMIC_RELAXED);
           status = kIOReturnIOError;
@@ -743,17 +776,15 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
           const uint64_t blk_idx = first_vr_blk + b;
           const uint64_t blk_off = b * VR_BLOCK_BYTES;
           const uint64_t abs_off = batch_start_byte + blk_off;
-          const size_t blk_len = static_cast<size_t>(
-              (abs_off + VR_BLOCK_BYTES <= batch_end_byte)
-                  ? VR_BLOCK_BYTES
-                  : (batch_end_byte - abs_off));
-          if (vr_verify_block(
-                  &verifiedView_,
-                  blk_idx,
-                  ctrl_->bounce_buf + blk_off,
-                  blk_len,
-                  &vr_xnu_crypto) != VR_OK) {
-            __atomic_fetch_add(&ctrl_->vr_integrity_errors, 1u, __ATOMIC_RELAXED);
+          const size_t blk_len =
+              static_cast<size_t>((abs_off + VR_BLOCK_BYTES <= batch_end_byte)
+                                      ? VR_BLOCK_BYTES
+                                      : (batch_end_byte - abs_off));
+          if (vr_verify_block(&verifiedView_, blk_idx,
+                              ctrl_->bounce_buf + blk_off, blk_len,
+                              &vr_xnu_crypto) != VR_OK) {
+            __atomic_fetch_add(&ctrl_->vr_integrity_errors, 1u,
+                               __ATOMIC_RELAXED);
             status = kIOReturnNotPrivileged;
             break;
           }
@@ -763,13 +794,15 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
           break;
         }
 
-        const uint64_t slice_end = (end_byte < batch_end_byte) ? end_byte : batch_end_byte;
-        const size_t slice_off = static_cast<size_t>(cur_byte - batch_start_byte);
-        const IOByteCount slice_len = static_cast<IOByteCount>(slice_end - cur_byte);
-        if (buffer->writeBytes(
-                static_cast<IOByteCount>(actual_bytes),
-                ctrl_->bounce_buf + slice_off,
-                slice_len) != slice_len) {
+        const uint64_t slice_end =
+            (end_byte < batch_end_byte) ? end_byte : batch_end_byte;
+        const size_t slice_off =
+            static_cast<size_t>(cur_byte - batch_start_byte);
+        const IOByteCount slice_len =
+            static_cast<IOByteCount>(slice_end - cur_byte);
+        if (buffer->writeBytes(static_cast<IOByteCount>(actual_bytes),
+                               ctrl_->bounce_buf + slice_off,
+                               slice_len) != slice_len) {
           __atomic_fetch_add(&ctrl_->io_errors, 1u, __ATOMIC_RELAXED);
           status = kIOReturnIOError;
           break;
@@ -786,16 +819,15 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
         const uint32_t chunk = static_cast<uint32_t>(rem > 64ULL ? 64ULL : rem);
         const uint32_t chunk_bytes = chunk * 512u;
         const int32_t rc = sm6125_emmc_ctrl_read_sectors(
-            &ctrl_->core, baseLba_ + block + done_sectors, chunk, ctrl_->bounce_buf);
+            &ctrl_->core, baseLba_ + block + done_sectors, chunk,
+            ctrl_->bounce_buf);
         if (rc != SM6125_EMMC_RC_OK) {
           __atomic_fetch_add(&ctrl_->io_errors, 1u, __ATOMIC_RELAXED);
           status = kIOReturnIOError;
           break;
         }
-        if (buffer->writeBytes(
-                static_cast<IOByteCount>(actual_bytes),
-                ctrl_->bounce_buf,
-                chunk_bytes) != chunk_bytes) {
+        if (buffer->writeBytes(static_cast<IOByteCount>(actual_bytes),
+                               ctrl_->bounce_buf, chunk_bytes) != chunk_bytes) {
           __atomic_fetch_add(&ctrl_->io_errors, 1u, __ATOMIC_RELAXED);
           status = kIOReturnIOError;
           break;
@@ -809,25 +841,30 @@ class Sm6125EmmcBlock : public IOBlockStorageDevice {
     const uint64_t t1 = blk_now_us();
     if (status == kIOReturnSuccess) {
       __atomic_fetch_add(&ctrl_->io_requests, 1u, __ATOMIC_RELAXED);
-      __atomic_fetch_add(&ctrl_->io_sectors, read_sectors_total, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&ctrl_->io_sectors, read_sectors_total,
+                         __ATOMIC_RELAXED);
       if (t1 > t0) {
         __atomic_fetch_add(&ctrl_->io_time_us, t1 - t0, __ATOMIC_RELAXED);
       }
     }
     IOLockUnlock(ctrl_->gate);
 
-    completion->action(completion->target, completion->parameter, status, actual_bytes);
+    completion->action(completion->target, completion->parameter, status,
+                       actual_bytes);
     return kIOReturnSuccess;
   }
 };
 
-OSDefineMetaClassAndStructors(Sm6125EmmcBlock, IOBlockStorageDevice)
-static_assert(sizeof(IOBlockStorageDevice) == 0x90, "Expected 0x90 IOBlockStorageDevice ABI");
+OSDefineMetaClassAndStructors(
+    Sm6125EmmcBlock,
+    IOBlockStorageDevice) static_assert(sizeof(IOBlockStorageDevice) == 0x90,
+                                        "Expected 0x90 IOBlockStorageDevice "
+                                        "ABI");
 
 namespace {
 
-static int verified_volume_query(dev_t device, const char *expectedUUID, uint8_t *manifestDigest)
-{
+static int verified_volume_query(dev_t device, const char *expectedUUID,
+                                 uint8_t *manifestDigest) {
   OSDictionary *matching = IOService::serviceMatching("IOMedia");
   OSDictionary *properties = OSDictionary::withCapacity(2);
   OSNumber *mjr = OSNumber::withNumber(
@@ -847,7 +884,8 @@ static int verified_volume_query(dev_t device, const char *expectedUUID, uint8_t
   mnr->release();
   mjr->release();
   properties->release();
-  OSIterator *iterator = ready ? IOService::getMatchingServices(matching) : nullptr;
+  OSIterator *iterator =
+      ready ? IOService::getMatchingServices(matching) : nullptr;
   matching->release();
   if (!iterator) {
     return 0;
@@ -865,7 +903,8 @@ static int verified_volume_query(dev_t device, const char *expectedUUID, uint8_t
       authenticated = false;
       break;
     }
-    OSString *uuid = OSDynamicCast(OSString, media->getProperty(kIOMediaUUIDKey));
+    OSString *uuid =
+        OSDynamicCast(OSString, media->getProperty(kIOMediaUUIDKey));
     if (!uuid || uuid->getLength() != 36u ||
         (expectedUUID && strcmp(expectedUUID, uuid->getCStringNoCopy()) != 0)) {
       continue;
@@ -877,7 +916,8 @@ static int verified_volume_query(dev_t device, const char *expectedUUID, uint8_t
       if (!block) {
         continue;
       }
-      authenticated = block->authenticatesVolume(uuid->getCStringNoCopy(), manifestDigest);
+      authenticated =
+          block->authenticatesVolume(uuid->getCStringNoCopy(), manifestDigest);
       break;
     }
   }
@@ -891,18 +931,275 @@ static int verified_volume_query(dev_t device, const char *expectedUUID, uint8_t
   return 1;
 }
 
-}  // namespace
+static bool verify_ctrl_gpt_locked(Sm6125SharedEmmcCtrl *ctrl,
+                                   uint32_t *out_hdr_crc,
+                                   uint32_t *out_parts_crc) {
+  if (!ctrl || !ctrl->core.online) {
+    return false;
+  }
+  uint8_t hdr[512];
+  if (sm6125_emmc_ctrl_read_sectors(&ctrl->core, 1ULL, 1u, hdr) !=
+      SM6125_EMMC_RC_OK) {
+    return false;
+  }
+  static const uint8_t kEfiSig[8] = {'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T'};
+  if (memcmp(hdr, kEfiSig, 8u) != 0) {
+    return false;
+  }
+  uint32_t stored_hdr_crc = 0;
+  uint32_t hdr_size = 0;
+  uint32_t num_parts = 0;
+  uint32_t part_sz = 0;
+  uint64_t part_lba = 0;
+  memcpy(&hdr_size, hdr + 12u, 4u);
+  memcpy(&stored_hdr_crc, hdr + 16u, 4u);
+  memcpy(&part_lba, hdr + 72u, 8u);
+  memcpy(&num_parts, hdr + 80u, 4u);
+  memcpy(&part_sz, hdr + 84u, 4u);
+  if (hdr_size != 92u || part_lba != 2ULL || part_sz != 128u ||
+      num_parts == 0u || num_parts > 128u) {
+    return false;
+  }
+  uint8_t zeroed[92];
+  memcpy(zeroed, hdr, 92u);
+  memset(zeroed + 16u, 0, 4u);
+  const uint32_t hdr_crc = blk_crc32_le(zeroed, 92u);
+  if (hdr_crc != stored_hdr_crc) {
+    return false;
+  }
+  const size_t array_bytes = static_cast<size_t>(num_parts) * 128u;
+  const uint32_t sectors = static_cast<uint32_t>((array_bytes + 511u) / 512u);
+  if (sectors == 0u || sectors > 32u) {
+    return false;
+  }
+  uint8_t *parts =
+      static_cast<uint8_t *>(IOMallocZero(static_cast<size_t>(sectors) * 512u));
+  if (!parts) {
+    return false;
+  }
+  const int32_t rd_rc =
+      sm6125_emmc_ctrl_read_sectors(&ctrl->core, part_lba, sectors, parts);
+  const uint32_t parts_crc =
+      (rd_rc == SM6125_EMMC_RC_OK) ? blk_crc32_le(parts, array_bytes) : 0u;
+  IOFree(parts, static_cast<size_t>(sectors) * 512u);
+  if (rd_rc != SM6125_EMMC_RC_OK) {
+    return false;
+  }
+  if (out_hdr_crc) {
+    *out_hdr_crc = hdr_crc;
+  }
+  if (out_parts_crc) {
+    *out_parts_crc = parts_crc;
+  }
+  return parts_crc == ctrl->core.gpt_parts_crc;
+}
 
-extern "C" int native_verified_block_root_authorized(dev_t device)
-{
+static bool has_chosen_data_ramdisk(void) {
+  IORegistryEntry *map =
+      IORegistryEntry::fromPath("/chosen/memory-map", gIODTPlane);
+  if (!map) {
+    return false;
+  }
+  const bool found = (map->getProperty("PackedRAMDisk") != nullptr) ||
+                     (map->getProperty("RAMDisk") != nullptr);
+  map->release();
+  return found;
+}
+
+static bool has_matching_media_uuid(const char *uuid_str) {
+  if (!uuid_str || strlen(uuid_str) != 36u) {
+    return false;
+  }
+  OSDictionary *matching = IOService::serviceMatching("IOMedia");
+  OSDictionary *props = OSDictionary::withCapacity(1);
+  OSString *wanted = OSString::withCString(uuid_str);
+  if (!matching || !props || !wanted) {
+    OSSafeReleaseNULL(wanted);
+    OSSafeReleaseNULL(props);
+    OSSafeReleaseNULL(matching);
+    return false;
+  }
+  const bool ready = props->setObject(kIOMediaUUIDKey, wanted) &&
+                     matching->setObject("IOPropertyMatch", props);
+  wanted->release();
+  props->release();
+  OSIterator *iter = ready ? IOService::getMatchingServices(matching) : nullptr;
+  matching->release();
+  if (!iter) {
+    return false;
+  }
+  bool found = false;
+  if (OSObject *obj = iter->getNextObject()) {
+    found = (OSDynamicCast(IOService, obj) != nullptr);
+  }
+  iter->release();
+  return found;
+}
+
+static int store_write_common(uint64_t block_4k, uint32_t count_4k,
+                              const void *src, bool flush) {
+  Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
+  if (!ctrl || !ctrl->persist_window_open || !src || count_4k == 0u ||
+      count_4k > (UINT32_MAX / 8u) || block_4k >= ctrl->store_blocks_4k ||
+      count_4k > ctrl->store_blocks_4k - block_4k) {
+    return 0;
+  }
+  const uint64_t lba = ctrl->store_first_lba + block_4k * 8ULL;
+  const uint32_t sectors = count_4k * 8u;
+  IOLockLock(ctrl->gate);
+  int32_t rc = sm6125_emmc_ctrl_write_sectors(
+      &ctrl->core, lba, sectors, static_cast<const uint8_t *>(src));
+  if (rc == SM6125_EMMC_RC_OK && flush) {
+    rc = sm6125_emmc_ctrl_flush_cache(&ctrl->core);
+  }
+  IOLockUnlock(ctrl->gate);
+  if (rc != SM6125_EMMC_RC_OK) {
+    __atomic_fetch_add(&ctrl->io_errors, 1u, __ATOMIC_RELAXED);
+    return 0;
+  }
+  return 1;
+}
+
+} // namespace
+
+extern "C" unsigned native_ufs_store_mode(void) {
+  Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
+  if (!ctrl || !ctrl->core.online || !ctrl->core.shngroot_bounds_set ||
+      !ctrl->persist_enabled) {
+    return 0u;
+  }
+  return 2u; /* Direct read-write SHNGDATA overlay in userdata tail */
+}
+
+extern "C" unsigned native_ufs_store_gpt_check(void) {
+  Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
+  if (!ctrl || !ctrl->core.online) {
+    return 0u;
+  }
+  uint32_t hdr_crc = 0;
+  uint32_t parts_crc = 0;
+  IOLockLock(ctrl->gate);
+  const bool ok = verify_ctrl_gpt_locked(ctrl, &hdr_crc, &parts_crc);
+  IOLockUnlock(ctrl->gate);
+  return (ok && hdr_crc == ctrl->init_gpt_hdr_crc &&
+          parts_crc == ctrl->init_gpt_parts_crc)
+             ? 1u
+             : 0u;
+}
+
+extern "C" int native_ufs_store_open(uint64_t blocks_4k, uint64_t *first_lba,
+                                     const char **why) {
+  if (first_lba) {
+    *first_lba = 0;
+  }
+  if (why) {
+    *why = "invalid";
+  }
+  Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
+  if (!ctrl || !ctrl->core.online || !ctrl->persist_enabled ||
+      !ctrl->core.shngroot_bounds_set || blocks_4k == 0u || !first_lba) {
+    if (why) {
+      *why = "store-disabled";
+    }
+    return 0;
+  }
+
+  /* Align start strictly past SHNGROOT + 4 MiB guard up to next 1 MiB (2048
+   * sectors). */
+  const uint64_t guarded =
+      ctrl->core.shngroot_end_lba + SM6125_EMMC_WRITE_GUARD_SECTORS;
+  const uint64_t aligned_first = (guarded + 2047ULL) & ~2047ULL;
+  if (blocks_4k > (UINT64_MAX / 8ULL) ||
+      aligned_first > ctrl->core.userdata_last) {
+    if (why) {
+      *why = "no-tail-space";
+    }
+    return 0;
+  }
+  const uint64_t need_sectors = blocks_4k * 8ULL;
+  if (need_sectors > (ctrl->core.userdata_last - aligned_first + 1ULL)) {
+    if (why) {
+      *why = "tail-too-small";
+    }
+    return 0;
+  }
+  const uint64_t last_lba = aligned_first + need_sectors - 1ULL;
+
+  IOLockLock(ctrl->gate);
+  const int32_t rc =
+      sm6125_emmc_ctrl_set_write_window(&ctrl->core, aligned_first, last_lba);
+  IOLockUnlock(ctrl->gate);
+  if (rc != SM6125_EMMC_RC_OK) {
+    if (why) {
+      *why = "lba-sandbox-refused";
+    }
+    return 0;
+  }
+
+  ctrl->store_first_lba = aligned_first;
+  ctrl->store_blocks_4k = blocks_4k;
+  ctrl->persist_window_open = true;
+  *first_lba = aligned_first;
+  if (why) {
+    *why = "ok";
+  }
+  return 1;
+}
+
+extern "C" int native_ufs_store_read(uint64_t block_4k, uint32_t count_4k,
+                                     void *dst) {
+  Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
+  if (!ctrl || !ctrl->persist_window_open || !dst || count_4k == 0u ||
+      count_4k > (UINT32_MAX / 8u) || block_4k >= ctrl->store_blocks_4k ||
+      count_4k > ctrl->store_blocks_4k - block_4k) {
+    return 0;
+  }
+  const uint64_t lba = ctrl->store_first_lba + block_4k * 8ULL;
+  const uint32_t sectors = count_4k * 8u;
+  IOLockLock(ctrl->gate);
+  const int32_t rc = sm6125_emmc_ctrl_read_sectors(&ctrl->core, lba, sectors,
+                                                   static_cast<uint8_t *>(dst));
+  IOLockUnlock(ctrl->gate);
+  if (rc != SM6125_EMMC_RC_OK) {
+    __atomic_fetch_add(&ctrl->io_errors, 1u, __ATOMIC_RELAXED);
+    return 0;
+  }
+  return 1;
+}
+
+extern "C" int native_ufs_store_write(uint64_t block_4k, uint32_t count_4k,
+                                      const void *src) {
+  return store_write_common(block_4k, count_4k, src, true);
+}
+
+extern "C" int native_ufs_store_write_cached(uint64_t block_4k,
+                                             uint32_t count_4k,
+                                             const void *src) {
+  return store_write_common(block_4k, count_4k, src, false);
+}
+
+extern "C" int native_ufs_store_sync(void) {
+  Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
+  if (!ctrl || !ctrl->persist_window_open) {
+    return 0;
+  }
+  IOLockLock(ctrl->gate);
+  const int32_t rc = sm6125_emmc_ctrl_flush_cache(&ctrl->core);
+  IOLockUnlock(ctrl->gate);
+  if (rc != SM6125_EMMC_RC_OK) {
+    __atomic_fetch_add(&ctrl->io_errors, 1u, __ATOMIC_RELAXED);
+    return 0;
+  }
+  return 1;
+}
+
+extern "C" int native_verified_block_root_authorized(dev_t device) {
   return verified_volume_query(device, nullptr, nullptr);
 }
 
-extern "C" int native_verified_block_manifest_sha384(
-    dev_t device,
-    const char *uuid,
-    uint8_t digest[48])
-{
+extern "C" int native_verified_block_manifest_sha384(dev_t device,
+                                                     const char *uuid,
+                                                     uint8_t digest[48]) {
   if (!digest) {
     return 0;
   }
@@ -913,12 +1210,9 @@ extern "C" int native_verified_block_manifest_sha384(
   return verified_volume_query(device, uuid, digest);
 }
 
-extern "C" int native_verified_block_volume_device(
-    const char *uuid,
-    dev_t *device,
-    char *path,
-    size_t size)
-{
+extern "C" int native_verified_block_volume_device(const char *uuid,
+                                                   dev_t *device, char *path,
+                                                   size_t size) {
   if (!uuid || !device || !path || size < 6u || strlen(uuid) != 36u) {
     return 0;
   }
@@ -937,7 +1231,8 @@ extern "C" int native_verified_block_volume_device(
                      matching->setObject("IOPropertyMatch", properties);
   wanted->release();
   properties->release();
-  OSIterator *iterator = ready ? IOService::getMatchingServices(matching) : nullptr;
+  OSIterator *iterator =
+      ready ? IOService::getMatchingServices(matching) : nullptr;
   matching->release();
   if (!iterator) {
     return 0;
@@ -956,15 +1251,15 @@ extern "C" int native_verified_block_volume_device(
       authenticated = false;
       break;
     }
-    OSString *identity = OSDynamicCast(OSString, media->getProperty(kIOMediaUUIDKey));
+    OSString *identity =
+        OSDynamicCast(OSString, media->getProperty(kIOMediaUUIDKey));
     OSString *name = OSDynamicCast(OSString, media->getProperty(kIOBSDNameKey));
     OSNumber *mjr = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMajorKey));
     OSNumber *mnr = OSDynamicCast(OSNumber, media->getProperty(kIOBSDMinorKey));
-    if (!identity || strcmp(identity->getCStringNoCopy(), uuid) != 0 ||
-        !name || !mjr || !mnr || !name->getLength() ||
+    if (!identity || strcmp(identity->getCStringNoCopy(), uuid) != 0 || !name ||
+        !mjr || !mnr || !name->getLength() ||
         name->getLength() >= sizeof(candidatePath) - 6u ||
-        name->getLength() >= size - 6u ||
-        mjr->unsigned64BitValue() > 255ULL ||
+        name->getLength() >= size - 6u || mjr->unsigned64BitValue() > 255ULL ||
         mnr->unsigned64BitValue() > 0xFFFFFFULL) {
       continue;
     }
@@ -973,7 +1268,8 @@ extern "C" int native_verified_block_volume_device(
     if (!native_verified_block_root_authorized(candidate)) {
       continue;
     }
-    snprintf(candidatePath, sizeof(candidatePath), "/dev/%s", name->getCStringNoCopy());
+    snprintf(candidatePath, sizeof(candidatePath), "/dev/%s",
+             name->getCStringNoCopy());
     authenticated = true;
   }
   iterator->release();
@@ -987,21 +1283,24 @@ extern "C" int native_verified_block_volume_device(
 
 namespace {
 
-static const char *blk_mode_name(uint32_t mode)
-{
+static const char *blk_mode_name(uint32_t mode) {
   switch (mode) {
-    case SM6125_EMMC_FAST_MODE_HS50_PIO: return "hs50-pio";
-    case SM6125_EMMC_FAST_MODE_HS50_ADMA: return "hs50-adma";
-    case SM6125_EMMC_FAST_MODE_DDR52_ADMA: return "ddr52-adma";
-    default: return "none";
+  case SM6125_EMMC_FAST_MODE_HS50_PIO:
+    return "hs50-pio";
+  case SM6125_EMMC_FAST_MODE_HS50_ADMA:
+    return "hs50-adma";
+  case SM6125_EMMC_FAST_MODE_DDR52_ADMA:
+    return "ddr52-adma";
+  default:
+    return "none";
   }
 }
 
-static bool has_sm6125_ancestry(IOService *service, bool *out_saw_driver)
-{
+static bool has_sm6125_ancestry(IOService *service, bool *out_saw_driver) {
   bool saw_drv = false;
   unsigned depth = 0;
-  for (IOService *cur = service; cur && depth < 32u; cur = cur->getProvider(), depth++) {
+  for (IOService *cur = service; cur && depth < 32u;
+       cur = cur->getProvider(), depth++) {
     if (cur->metaCast("IOBlockStorageDriver") != nullptr) {
       saw_drv = true;
     }
@@ -1029,8 +1328,8 @@ struct IokitStorageObservation {
   bool sysos_auth;
 };
 
-static void observe_iokit_storage(bool has_shngroot, IokitStorageObservation *obs)
-{
+static void observe_iokit_storage(bool has_shngroot,
+                                  IokitStorageObservation *obs) {
   memset(obs, 0, sizeof(*obs));
   OSDictionary *matching = IOService::serviceMatching("IOMedia");
   if (!matching) {
@@ -1051,7 +1350,8 @@ static void observe_iokit_storage(bool has_shngroot, IokitStorageObservation *ob
       continue;
     }
     obs->media_count++;
-    OSBoolean *whole = OSDynamicCast(OSBoolean, media->getProperty(kIOMediaWholeKey));
+    OSBoolean *whole =
+        OSDynamicCast(OSBoolean, media->getProperty(kIOMediaWholeKey));
     const bool is_whole = (whole == kOSBooleanTrue);
     if (!is_whole) {
       obs->part_count++;
@@ -1060,26 +1360,33 @@ static void observe_iokit_storage(bool has_shngroot, IokitStorageObservation *ob
     if (bsd && bsd->getLength() > 0) {
       obs->bsd_count++;
       if (obs->first_bsd[0] == '\0' && is_whole) {
-        strlcpy(obs->first_bsd, bsd->getCStringNoCopy(), sizeof(obs->first_bsd));
+        strlcpy(obs->first_bsd, bsd->getCStringNoCopy(),
+                sizeof(obs->first_bsd));
       }
     }
-    OSString *uuid = OSDynamicCast(OSString, media->getProperty(kIOMediaUUIDKey));
+    OSString *uuid =
+        OSDynamicCast(OSString, media->getProperty(kIOMediaUUIDKey));
     const char *mname = media->getName();
     if (!has_shngroot) {
-      if (mname && strcmp(mname, "userdata") == 0 && bsd && bsd->getLength() > 0) {
-        strlcpy(obs->target_bsd, bsd->getCStringNoCopy(), sizeof(obs->target_bsd));
+      if (mname && strcmp(mname, "userdata") == 0 && bsd &&
+          bsd->getLength() > 0) {
+        strlcpy(obs->target_bsd, bsd->getCStringNoCopy(),
+                sizeof(obs->target_bsd));
         if (uuid && uuid->getLength() > 0) {
-          strlcpy(obs->target_uuid, uuid->getCStringNoCopy(), sizeof(obs->target_uuid));
+          strlcpy(obs->target_uuid, uuid->getCStringNoCopy(),
+                  sizeof(obs->target_uuid));
         }
       }
     } else if (uuid && uuid->getLength() == 36 && bsd && bsd->getLength() > 0) {
       const char *ustr = uuid->getCStringNoCopy();
       if (strcmp(ustr, kOsVolumeUuid) == 0) {
         strlcpy(obs->os_bsd, bsd->getCStringNoCopy(), sizeof(obs->os_bsd));
-        strlcpy(obs->target_bsd, bsd->getCStringNoCopy(), sizeof(obs->target_bsd));
+        strlcpy(obs->target_bsd, bsd->getCStringNoCopy(),
+                sizeof(obs->target_bsd));
         strlcpy(obs->target_uuid, ustr, sizeof(obs->target_uuid));
       } else if (strcmp(ustr, kSystemOsVolumeUuid) == 0) {
-        strlcpy(obs->sysos_bsd, bsd->getCStringNoCopy(), sizeof(obs->sysos_bsd));
+        strlcpy(obs->sysos_bsd, bsd->getCStringNoCopy(),
+                sizeof(obs->sysos_bsd));
       }
     }
   }
@@ -1089,26 +1396,27 @@ static void observe_iokit_storage(bool has_shngroot, IokitStorageObservation *ob
     dev_t dev = NODEV;
     char dev_path[64] = {};
     if (obs->os_bsd[0] != '\0' &&
-        native_verified_block_volume_device(kOsVolumeUuid, &dev, dev_path, sizeof(dev_path)) == 1) {
+        native_verified_block_volume_device(kOsVolumeUuid, &dev, dev_path,
+                                            sizeof(dev_path)) == 1) {
       obs->os_auth = true;
     }
     if (obs->sysos_bsd[0] != '\0' &&
-        native_verified_block_volume_device(kSystemOsVolumeUuid, &dev, dev_path, sizeof(dev_path)) == 1) {
+        native_verified_block_volume_device(kSystemOsVolumeUuid, &dev, dev_path,
+                                            sizeof(dev_path)) == 1) {
       obs->sysos_auth = true;
     }
   }
 }
 
-static void noop_completion(void *target, void *parameter, IOReturn status, UInt64 actualByteCount)
-{
+static void noop_completion(void *target, void *parameter, IOReturn status,
+                            UInt64 actualByteCount) {
   (void)target;
   (void)parameter;
   (void)status;
   (void)actualByteCount;
 }
 
-static bool verify_write_protection_refusal(Sm6125EmmcBlock *dev)
-{
+static bool verify_write_protection_refusal(Sm6125EmmcBlock *dev) {
   uint8_t dummy[512] = {};
   IOMemoryDescriptor *out_md =
       IOMemoryDescriptor::withAddress(dummy, sizeof(dummy), kIODirectionOut);
@@ -1125,11 +1433,9 @@ static bool verify_write_protection_refusal(Sm6125EmmcBlock *dev)
   return rc == kIOReturnNotWritable;
 }
 
-static const sm6125_shngroot_entry_t *find_shngroot_entry(
-    const sm6125_shngroot_manifest_t &manifest,
-    const char *name,
-    uint32_t expected_flags)
-{
+static const sm6125_shngroot_entry_t *
+find_shngroot_entry(const sm6125_shngroot_manifest_t &manifest,
+                    const char *name, uint32_t expected_flags) {
   for (uint32_t i = 0; i < manifest.entry_count; ++i) {
     if (manifest.entries[i].flags == expected_flags &&
         strcmp(manifest.entries[i].name, name) == 0) {
@@ -1139,12 +1445,10 @@ static const sm6125_shngroot_entry_t *find_shngroot_entry(
   return nullptr;
 }
 
-static Sm6125EmmcBlock *publish_raw_window_device(
-    Sm6125SharedEmmcCtrl *ctrl,
-    const char *name,
-    uint64_t base_lba,
-    uint64_t sector_count)
-{
+static Sm6125EmmcBlock *publish_raw_window_device(Sm6125SharedEmmcCtrl *ctrl,
+                                                  const char *name,
+                                                  uint64_t base_lba,
+                                                  uint64_t sector_count) {
   IOService *platform = IOService::getPlatform();
   if (!platform) {
     return nullptr;
@@ -1153,7 +1457,8 @@ static Sm6125EmmcBlock *publish_raw_window_device(
   if (!dev) {
     return nullptr;
   }
-  if (!dev->init(nullptr) || !dev->configureWindow(ctrl, name, base_lba, sector_count, false)) {
+  if (!dev->init(nullptr) ||
+      !dev->configureWindow(ctrl, name, base_lba, sector_count, false)) {
     dev->release();
     return nullptr;
   }
@@ -1170,11 +1475,10 @@ static Sm6125EmmcBlock *publish_raw_window_device(
   return dev;
 }
 
-static Sm6125EmmcBlock *publish_verified_window_device(
-    Sm6125SharedEmmcCtrl *ctrl,
-    const sm6125_shngroot_entry_t &win_entry,
-    const sm6125_shngroot_entry_t *vroot_entry)
-{
+static Sm6125EmmcBlock *
+publish_verified_window_device(Sm6125SharedEmmcCtrl *ctrl,
+                               const sm6125_shngroot_entry_t &win_entry,
+                               const sm6125_shngroot_entry_t *vroot_entry) {
   IOService *platform = IOService::getPlatform();
   if (!platform) {
     return nullptr;
@@ -1183,7 +1487,8 @@ static Sm6125EmmcBlock *publish_verified_window_device(
   if (!dev) {
     return nullptr;
   }
-  if (!dev->init(nullptr) || !dev->configureVerifiedWindow(ctrl, win_entry, vroot_entry)) {
+  if (!dev->init(nullptr) ||
+      !dev->configureVerifiedWindow(ctrl, win_entry, vroot_entry)) {
     dev->release();
     return nullptr;
   }
@@ -1200,12 +1505,12 @@ static Sm6125EmmcBlock *publish_verified_window_device(
   return dev;
 }
 
-}  // namespace
+} // namespace
 
-extern "C" void sm6125_emmc_block_late_init(void)
-{
+extern "C" void sm6125_emmc_block_late_init(void) {
   uint32_t arg_val = 0;
-  const bool has_arg = PE_parse_boot_argn("sm6125-emmc-block", &arg_val, sizeof(arg_val));
+  const bool has_arg =
+      PE_parse_boot_argn("sm6125-emmc-block", &arg_val, sizeof(arg_val));
   const uint32_t mode = sm6125_emmc_block_select_mode(has_arg, arg_val);
   if (mode == SM6125_EMMC_BLOCK_MODE_OFF) {
     return;
@@ -1213,15 +1518,16 @@ extern "C" void sm6125_emmc_block_late_init(void)
   if (mode == SM6125_EMMC_BLOCK_MODE_INVALID) {
     panic("SM6125-EMMC-BLK ok=0 err=invalid-mode arg=%u", arg_val);
   }
-  const bool diag_or_mount_diag =
-      (mode == SM6125_EMMC_BLOCK_MODE_DIAG || mode == SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG);
+  const bool diag_or_mount_diag = (mode == SM6125_EMMC_BLOCK_MODE_DIAG ||
+                                   mode == SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG);
 
-  const kern_return_t kext_rc = OSKextLoadKextWithIdentifier("com.apple.iokit.IOStorageFamily");
+  const kern_return_t kext_rc =
+      OSKextLoadKextWithIdentifier("com.apple.iokit.IOStorageFamily");
   const OSMetaClass *parent = lookup_meta("IOBlockStorageDevice");
   if (kext_rc != KERN_SUCCESS || !parent || parent->getClassSize() != 0x90u) {
     if (diag_or_mount_diag) {
-      panic("SM6125-EMMC-BLK ok=0 err=iostorage-abi krc=%d sz=%u",
-            kext_rc, parent ? parent->getClassSize() : 0u);
+      panic("SM6125-EMMC-BLK ok=0 err=iostorage-abi krc=%d sz=%u", kext_rc,
+            parent ? parent->getClassSize() : 0u);
     }
     IOLog("Sm6125EmmcBlock: IOStorageFamily unavailable (rc=%d)\n", kext_rc);
     return;
@@ -1238,6 +1544,7 @@ extern "C" void sm6125_emmc_block_late_init(void)
     }
     sm6125_ioblockstoragedevice_static_init();
     sm6125_emmc_block_static_init();
+    sm6125_native_ram_block_static_init();
     const OSReturn post_rc = OSMetaClass::postModLoad(handle);
     if (post_rc != kOSReturnSuccess) {
       if (diag_or_mount_diag) {
@@ -1251,15 +1558,18 @@ extern "C" void sm6125_emmc_block_late_init(void)
   uint64_t gcc_pa = 0;
   uint64_t sdhci_pa = 0;
   if (!read_dt_geometry(&gcc_pa, &sdhci_pa) ||
-      gcc_pa > (UINT64_MAX - SM6125_GCC_SDCC1_PAGE_OFFSET - SM6125_GCC_SDCC1_WINDOW_SIZE)) {
+      gcc_pa > (UINT64_MAX - SM6125_GCC_SDCC1_PAGE_OFFSET -
+                SM6125_GCC_SDCC1_WINDOW_SIZE)) {
     if (diag_or_mount_diag) {
       panic("SM6125-EMMC-BLK ok=0 err=dt-geometry");
     }
     return;
   }
 
-  auto *ctrl = static_cast<Sm6125SharedEmmcCtrl *>(IOMallocZero(sizeof(Sm6125SharedEmmcCtrl)));
-  uint8_t *shng_hdr = static_cast<uint8_t *>(IOMallocZero(SM6125_SHNGROOT_HEADER_BYTES));
+  auto *ctrl = static_cast<Sm6125SharedEmmcCtrl *>(
+      IOMallocZero(sizeof(Sm6125SharedEmmcCtrl)));
+  uint8_t *shng_hdr =
+      static_cast<uint8_t *>(IOMallocZero(SM6125_SHNGROOT_HEADER_BYTES));
   if (!ctrl || !shng_hdr) {
     if (diag_or_mount_diag) {
       panic("SM6125-EMMC-BLK ok=0 err=alloc-ctrl");
@@ -1270,16 +1580,11 @@ extern "C" void sm6125_emmc_block_late_init(void)
   ctrl->gate = IOLockAlloc();
   ctrl->bounce_buf = static_cast<uint8_t *>(IOMallocZero(kBounceBufBytes));
   if (!ctrl->gate || !ctrl->bounce_buf ||
-      !map_mmio_window(
-          gcc_pa + SM6125_GCC_SDCC1_PAGE_OFFSET,
-          SM6125_GCC_SDCC1_WINDOW_SIZE,
-          &ctrl->gcc_desc,
-          &ctrl->gcc_map) ||
-      !map_mmio_window(
-          sdhci_pa,
-          SM6125_SDHCI_MIN_REGION_SIZE,
-          &ctrl->sdhci_desc,
-          &ctrl->sdhci_map)) {
+      !map_mmio_window(gcc_pa + SM6125_GCC_SDCC1_PAGE_OFFSET,
+                       SM6125_GCC_SDCC1_WINDOW_SIZE, &ctrl->gcc_desc,
+                       &ctrl->gcc_map) ||
+      !map_mmio_window(sdhci_pa, SM6125_SDHCI_MIN_REGION_SIZE,
+                       &ctrl->sdhci_desc, &ctrl->sdhci_map)) {
     if (diag_or_mount_diag) {
       panic("SM6125-EMMC-BLK ok=0 err=map-mmio");
     }
@@ -1288,22 +1593,26 @@ extern "C" void sm6125_emmc_block_late_init(void)
 
   sm6125_emmc_dma_buf_t dma = {};
   const bool has_dma = alloc_ctrl_dma(ctrl, &dma);
-  const uintptr_t gcc_va = static_cast<uintptr_t>(ctrl->gcc_map->getVirtualAddress());
-  const uintptr_t sdhci_va = static_cast<uintptr_t>(ctrl->sdhci_map->getVirtualAddress());
+  const uintptr_t gcc_va =
+      static_cast<uintptr_t>(ctrl->gcc_map->getVirtualAddress());
+  const uintptr_t sdhci_va =
+      static_cast<uintptr_t>(ctrl->sdhci_map->getVirtualAddress());
 
   const int32_t init_rc = sm6125_emmc_ctrl_init(
       &ctrl->core, &kBlockHwOps, gcc_va, sdhci_va, has_dma ? &dma : nullptr);
   if (init_rc != SM6125_EMMC_RC_OK || !ctrl->core.online) {
     if (diag_or_mount_diag) {
-      panic("SM6125-EMMC-BLK ok=0 err=ctrl-init step=%u rc=%d",
-            ctrl->core.step, init_rc);
+      panic("SM6125-EMMC-BLK ok=0 err=ctrl-init step=%u rc=%d", ctrl->core.step,
+            init_rc);
     }
     return;
   }
   g_shared_ctrl = ctrl;
 
-  /* Read first 4096 bytes (8 sectors) of userdata to probe SHNGROOT manifest. */
-  const uint64_t ud_sectors = ctrl->core.userdata_last - ctrl->core.userdata_first + 1ULL;
+  /* Read first 4096 bytes (8 sectors) of userdata to probe SHNGROOT manifest.
+   */
+  const uint64_t ud_sectors =
+      ctrl->core.userdata_last - ctrl->core.userdata_first + 1ULL;
   const uint64_t ud_bytes = ud_sectors * 512ULL;
   const int32_t hdr_read_rc = sm6125_emmc_ctrl_read_sectors(
       &ctrl->core, ctrl->core.userdata_first, 8u, shng_hdr);
@@ -1322,20 +1631,43 @@ extern "C" void sm6125_emmc_block_late_init(void)
   Sm6125EmmcBlock *first_dev = nullptr;
 
   if (has_shngroot) {
-    /* Publish SystemOS first and OS last so SystemOS is already ready when root mounts. */
+    const int32_t bnd_rc =
+        sm6125_emmc_ctrl_set_shngroot_bounds(&ctrl->core, manifest.image_bytes);
+    uint32_t hdr_crc = 0;
+    uint32_t parts_crc = 0;
+    const bool gpt_ok = verify_ctrl_gpt_locked(ctrl, &hdr_crc, &parts_crc);
+    if (bnd_rc != SM6125_EMMC_RC_OK || !gpt_ok) {
+      if (diag_or_mount_diag) {
+        panic("SM6125-EMMC-BLK ok=0 err=sandbox-init bnd=%d gpt=%u", bnd_rc,
+              gpt_ok ? 1u : 0u);
+      }
+      return;
+    }
+    ctrl->init_gpt_hdr_crc = hdr_crc;
+    ctrl->init_gpt_parts_crc = parts_crc;
+
+    uint32_t persist_arg = 0;
+    ctrl->persist_enabled =
+        PE_parse_boot_argn("sm6125-data-persist", &persist_arg,
+                           sizeof(persist_arg)) &&
+        persist_arg == 1u;
+
+    /* Publish SystemOS first and OS last so SystemOS is already ready when root
+     * mounts. */
     static const char *const kPublishOrder[2] = {"SystemOS", "OS"};
     for (unsigned ord = 0; ord < 2u; ++ord) {
       const char *win_name = kPublishOrder[ord];
-      const sm6125_shngroot_entry_t *win_ent =
-          find_shngroot_entry(manifest, win_name, SM6125_SHNGROOT_FLAG_RO_WINDOW);
+      const sm6125_shngroot_entry_t *win_ent = find_shngroot_entry(
+          manifest, win_name, SM6125_SHNGROOT_FLAG_RO_WINDOW);
       if (!win_ent) {
         continue;
       }
       char vroot_name[32] = {};
       snprintf(vroot_name, sizeof(vroot_name), "%s.vroot", win_name);
-      const sm6125_shngroot_entry_t *vroot_ent =
-          find_shngroot_entry(manifest, vroot_name, SM6125_SHNGROOT_FLAG_OBJECT);
-      Sm6125EmmcBlock *dev = publish_verified_window_device(ctrl, *win_ent, vroot_ent);
+      const sm6125_shngroot_entry_t *vroot_ent = find_shngroot_entry(
+          manifest, vroot_name, SM6125_SHNGROOT_FLAG_OBJECT);
+      Sm6125EmmcBlock *dev =
+          publish_verified_window_device(ctrl, *win_ent, vroot_ent);
       if (!dev) {
         if (diag_or_mount_diag) {
           panic("SM6125-EMMC-BLK ok=0 err=vroot-open win=%s shng_v=%u",
@@ -1348,10 +1680,26 @@ extern "C" void sm6125_emmc_block_late_init(void)
       }
       published_devs++;
     }
+    if (has_chosen_data_ramdisk()) {
+      IOService *platform = IOService::getPlatform();
+      OSObject *ram_obj = OSMetaClass::allocClassWithName("NativeRamBlock");
+      IOService *ram_dev = OSDynamicCast(IOService, ram_obj);
+      if (!platform || !ram_dev || !ram_dev->init(nullptr) ||
+          !ram_dev->attach(platform) || !ram_dev->start(platform)) {
+        OSSafeReleaseNULL(ram_obj);
+        if (diag_or_mount_diag) {
+          panic("SM6125-EMMC-BLK ok=0 err=ramblock-start");
+        }
+        return;
+      }
+      ctrl->ram_started = true;
+    }
   } else if (mode == SM6125_EMMC_BLOCK_MODE_DIAG) {
-    /* Before flashing userdata-root.img, publish whole read-only eMMC so Apple's
-     * IOBlockStorageDriver + IOGUIDPartitionScheme + IOMediaBSDClient attach and parse real GPT! */
-    first_dev = publish_raw_window_device(ctrl, "whole-emmc", 0ULL, ctrl->core.sec_count);
+    /* Before flashing userdata-root.img, publish whole read-only eMMC so
+     * Apple's IOBlockStorageDriver + IOGUIDPartitionScheme + IOMediaBSDClient
+     * attach and parse real GPT! */
+    first_dev = publish_raw_window_device(ctrl, "whole-emmc", 0ULL,
+                                          ctrl->core.sec_count);
     if (first_dev) {
       published_devs = 1u;
     }
@@ -1359,156 +1707,206 @@ extern "C" void sm6125_emmc_block_late_init(void)
     if (diag_or_mount_diag) {
       panic("SM6125-EMMC-BLK ok=0 err=no-shngroot rc=%d", shng_rc);
     }
-    IOLog("Sm6125EmmcBlock: no valid SHNGROOT manifest in userdata (rc=%d)\n", shng_rc);
+    IOLog("Sm6125EmmcBlock: no valid SHNGROOT manifest in userdata (rc=%d)\n",
+          shng_rc);
     return;
   }
 
-  const bool wr_refused = first_dev ? verify_write_protection_refusal(first_dev) : false;
+  const bool wr_refused =
+      first_dev ? verify_write_protection_refusal(first_dev) : false;
 
   IokitStorageObservation obs = {};
+  bool data_media_ready = !ctrl->ram_started;
   for (unsigned poll = 0; poll < 160u; poll++) {
     observe_iokit_storage(has_shngroot, &obs);
+    if (ctrl->ram_started && !data_media_ready) {
+      data_media_ready = has_matching_media_uuid(kDataVolumeUuid);
+    }
     if (has_shngroot) {
       if (obs.saw_driver && obs.os_auth && obs.sysos_auth) {
-        break;
+        if (obs.saw_driver && obs.os_auth && obs.sysos_auth &&
+            data_media_ready) {
+          break;
+        }
+      } else {
+        if (obs.saw_driver && obs.part_count >= 30u &&
+            obs.target_bsd[0] != '\0') {
+          break;
+        }
       }
-    } else {
-      if (obs.saw_driver && obs.part_count >= 30u && obs.target_bsd[0] != '\0') {
-        break;
-      }
+      IOSleep(50);
     }
-    IOSleep(50);
-  }
-  strlcpy(ctrl->os_bsd, obs.os_bsd, sizeof(ctrl->os_bsd));
-  strlcpy(ctrl->sysos_bsd, obs.sysos_bsd, sizeof(ctrl->sysos_bsd));
+    strlcpy(ctrl->os_bsd, obs.os_bsd, sizeof(ctrl->os_bsd));
+    strlcpy(ctrl->sysos_bsd, obs.sysos_bsd, sizeof(ctrl->sysos_bsd));
 
-  if (mode == SM6125_EMMC_BLOCK_MODE_PUBLISH) {
-    return;
-  }
+    if (mode == SM6125_EMMC_BLOCK_MODE_PUBLISH) {
+      return;
+    }
 
-  const uint32_t reqs = __atomic_load_n(&ctrl->io_requests, __ATOMIC_RELAXED);
-  const uint32_t errs = __atomic_load_n(&ctrl->io_errors, __ATOMIC_RELAXED);
-  const uint32_t wrej = __atomic_load_n(&ctrl->write_rejects, __ATOMIC_RELAXED);
-  const uint32_t vr_blks = __atomic_load_n(&ctrl->vr_verified_blocks, __ATOMIC_RELAXED);
-  const uint32_t vr_errs = __atomic_load_n(&ctrl->vr_integrity_errors, __ATOMIC_RELAXED);
-  const uint64_t secs = __atomic_load_n(&ctrl->io_sectors, __ATOMIC_RELAXED);
-  const uint64_t us = __atomic_load_n(&ctrl->io_time_us, __ATOMIC_RELAXED);
-  const uint32_t kib = static_cast<uint32_t>((secs * 512ULL) / 1024ULL);
-  const uint32_t kibs = (us > 0ULL)
-      ? static_cast<uint32_t>(((secs * 512ULL / 1024ULL) * 1000000ULL) / us)
-      : 0u;
+    const uint32_t reqs = __atomic_load_n(&ctrl->io_requests, __ATOMIC_RELAXED);
+    const uint32_t errs = __atomic_load_n(&ctrl->io_errors, __ATOMIC_RELAXED);
+    const uint32_t wrej =
+        __atomic_load_n(&ctrl->write_rejects, __ATOMIC_RELAXED);
+    const uint32_t vr_blks =
+        __atomic_load_n(&ctrl->vr_verified_blocks, __ATOMIC_RELAXED);
+    const uint32_t vr_errs =
+        __atomic_load_n(&ctrl->vr_integrity_errors, __ATOMIC_RELAXED);
+    const uint64_t secs = __atomic_load_n(&ctrl->io_sectors, __ATOMIC_RELAXED);
+    const uint64_t us = __atomic_load_n(&ctrl->io_time_us, __ATOMIC_RELAXED);
+    const uint32_t kib = static_cast<uint32_t>((secs * 512ULL) / 1024ULL);
+    const uint32_t kibs =
+        (us > 0ULL) ? static_cast<uint32_t>(
+                          ((secs * 512ULL / 1024ULL) * 1000000ULL) / us)
+                    : 0u;
 
-  const bool all_ok =
-      published_devs > 0u &&
-      wr_refused &&
-      wrej >= 1u &&
-      errs == 0u &&
-      vr_errs == 0u &&
-      reqs > 0u &&
-      obs.saw_driver &&
-      obs.media_count >= 2u &&
-      obs.bsd_count >= 2u &&
-      (has_shngroot ? (obs.os_auth && obs.sysos_auth && vr_blks > 0u)
-                    : (obs.target_bsd[0] != '\0'));
+    const bool all_ok =
+        published_devs > 0u && wr_refused && wrej >= 1u && errs == 0u &&
+        vr_errs == 0u && reqs > 0u && obs.saw_driver && obs.media_count >= 2u &&
+        obs.bsd_count >= 2u && (!ctrl->ram_started || data_media_ready) &&
+        (has_shngroot ? (obs.os_auth && obs.sysos_auth && vr_blks > 0u)
+                      : (obs.target_bsd[0] != '\0'));
 
-  if (mode == SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG && all_ok) {
-    /* Return to bsd_init() so vfs_mountroot() and load_init_program() mount OS + SystemOS! */
-    return;
-  }
+    if (mode == SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG && all_ok) {
+      /* Return to bsd_init() so vfs_mountroot() and load_init_program() mount
+       * OS + SystemOS! */
+      return;
+    }
 
-  panic("SM6125-EMMC-BLK ok=%u mode=%s shng=%u devs=%u rc=%d\n"
-        "IO req=%u sec=%llu kib=%u us=%llu kibs=%u err=%u wr_rej=%u\n"
-        "VR blk=%u err=%u os=%s(%u) sys=%s(%u)\n"
-        "IOKIT drv=%u media=%u bsd=%u root=%s ud=%s parts=%u",
-        all_ok ? 1u : 0u,
-        blk_mode_name(ctrl->core.active_mode),
-        has_shngroot ? manifest.version : 0u,
-        published_devs,
-        init_rc,
-        reqs,
-        static_cast<unsigned long long>(secs),
-        kib,
-        static_cast<unsigned long long>(us),
-        kibs,
-        errs,
-        wrej,
-        vr_blks,
-        vr_errs,
-        obs.os_bsd[0] ? obs.os_bsd : "none",
-        obs.os_auth ? 1u : 0u,
-        obs.sysos_bsd[0] ? obs.sysos_bsd : "none",
-        obs.sysos_auth ? 1u : 0u,
-        obs.saw_driver ? 1u : 0u,
-        obs.media_count,
-        obs.bsd_count,
-        obs.first_bsd[0] ? obs.first_bsd : "none",
-        obs.target_bsd[0] ? obs.target_bsd : "none",
-        obs.part_count);
-}
-
-extern "C" void sm6125_emmc_post_mount_check(
-    int cache_error,
-    int launchd_ok,
-    int dyld_ok,
-    int dsc_ok)
-{
-  Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
-  if (!ctrl || ctrl->block_mode != SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG) {
-    return;
+    panic("SM6125-EMMC-BLK ok=%u mode=%s shng=%u devs=%u rc=%d\n"
+          "IO req=%u sec=%llu kib=%u us=%llu kibs=%u err=%u wr_rej=%u\n"
+          "VR blk=%u err=%u os=%s(%u) sys=%s(%u)\n"
+          "IOKIT drv=%u media=%u bsd=%u root=%s ud=%s parts=%u",
+          all_ok ? 1u : 0u, blk_mode_name(ctrl->core.active_mode),
+          has_shngroot ? manifest.version : 0u, published_devs, init_rc, reqs,
+          static_cast<unsigned long long>(secs), kib,
+          static_cast<unsigned long long>(us), kibs, errs, wrej, vr_blks,
+          vr_errs, obs.os_bsd[0] ? obs.os_bsd : "none", obs.os_auth ? 1u : 0u,
+          obs.sysos_bsd[0] ? obs.sysos_bsd : "none", obs.sysos_auth ? 1u : 0u,
+          obs.saw_driver ? 1u : 0u, obs.media_count, obs.bsd_count,
+          obs.first_bsd[0] ? obs.first_bsd : "none",
+          obs.target_bsd[0] ? obs.target_bsd : "none", obs.part_count);
   }
 
-  const uint32_t reqs = __atomic_load_n(&ctrl->io_requests, __ATOMIC_RELAXED);
-  const uint32_t errs = __atomic_load_n(&ctrl->io_errors, __ATOMIC_RELAXED);
-  const uint32_t vr_blks = __atomic_load_n(&ctrl->vr_verified_blocks, __ATOMIC_RELAXED);
-  const uint32_t vr_errs = __atomic_load_n(&ctrl->vr_integrity_errors, __ATOMIC_RELAXED);
-  const uint64_t secs = __atomic_load_n(&ctrl->io_sectors, __ATOMIC_RELAXED);
-  const uint64_t us = __atomic_load_n(&ctrl->io_time_us, __ATOMIC_RELAXED);
-  const uint32_t kib = static_cast<uint32_t>((secs * 512ULL) / 1024ULL);
-  const uint32_t kibs = (us > 0ULL)
-      ? static_cast<uint32_t>(((secs * 512ULL / 1024ULL) * 1000000ULL) / us)
-      : 0u;
+  extern "C" void sm6125_emmc_post_mount_check(int cache_error, int launchd_ok,
+                                               int dyld_ok, int dsc_ok) {
+    Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
+    if (!ctrl || ctrl->block_mode != SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG) {
+      if (!ctrl) {
+        return;
+      }
+      ctrl->root_check_valid = true;
+      ctrl->root_cache_err = cache_error;
+      ctrl->root_launchd_ok = launchd_ok;
+      ctrl->root_dyld_ok = dyld_ok;
+      ctrl->root_dsc_ok = dsc_ok;
 
-  const uint32_t man_tag =
-      (static_cast<uint32_t>(native_owner_boot_manifest_hash[0]) << 24u) |
-      (static_cast<uint32_t>(native_owner_boot_manifest_hash[1]) << 16u) |
-      (static_cast<uint32_t>(native_owner_boot_manifest_hash[2]) << 8u) |
-      static_cast<uint32_t>(native_owner_boot_manifest_hash[3]);
+      if (ctrl->block_mode != SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG) {
+        return;
+      }
 
-  const bool all_ok =
-      cache_error == 0 &&
-      native_owner_root_accepted == 1 &&
-      native_owner_cache_stage == 6 &&
-      native_owner_cache_status == 0 &&
-      native_owner_cache_native_union == 1 &&
-      native_owner_boot_manifest_status == 0 &&
-      launchd_ok == 1 &&
-      dyld_ok == 1 &&
-      dsc_ok == 1 &&
-      errs == 0u &&
-      vr_errs == 0u &&
-      vr_blks > 0u;
+      const bool root_ok =
+          cache_error == 0 && native_owner_root_accepted == 1 &&
+          native_owner_cache_stage == 6 && native_owner_cache_status == 0 &&
+          native_owner_cache_native_union == 1 &&
+          native_owner_boot_manifest_status == 0 && launchd_ok == 1 &&
+          dyld_ok == 1 && dsc_ok == 1;
 
-  panic("SM6125-ROOT-MNT ok=%u os=/dev/%s sys=%s union=%d\n"
-        "AUTH root=%d(ap=%d) sys_rc=%d stg=%d man=%d(%08x)\n"
-        "VFS launchd=%d dyld=%d dsc=%d\n"
-        "VR blk=%u err=%u IO req=%u kib=%u kibs=%u io_err=%u",
-        all_ok ? 1u : 0u,
-        ctrl->os_bsd[0] ? ctrl->os_bsd : "none",
-        native_owner_cache_device_path[0] ? native_owner_cache_device_path : "none",
-        native_owner_cache_native_union,
-        native_owner_root_accepted,
-        native_owner_root_apple_autherr,
-        cache_error,
-        native_owner_cache_stage,
-        native_owner_boot_manifest_status,
-        man_tag,
-        launchd_ok,
-        dyld_ok,
-        dsc_ok,
-        vr_blks,
-        vr_errs,
-        reqs,
-        kib,
-        kibs,
-        errs);
-}
+      if (ctrl->ram_started && root_ok) {
+        /* Defer final diagnostic report until native_owner_data_prepare()
+         * mounts /private/var. */
+        return;
+      }
+
+      const uint32_t reqs =
+          __atomic_load_n(&ctrl->io_requests, __ATOMIC_RELAXED);
+      const uint32_t errs = __atomic_load_n(&ctrl->io_errors, __ATOMIC_RELAXED);
+      const uint32_t vr_blks =
+          __atomic_load_n(&ctrl->vr_verified_blocks, __ATOMIC_RELAXED);
+      const uint32_t vr_errs =
+          __atomic_load_n(&ctrl->vr_integrity_errors, __ATOMIC_RELAXED);
+      const uint64_t secs =
+          __atomic_load_n(&ctrl->io_sectors, __ATOMIC_RELAXED);
+      const uint64_t us = __atomic_load_n(&ctrl->io_time_us, __ATOMIC_RELAXED);
+      const uint32_t kib = static_cast<uint32_t>((secs * 512ULL) / 1024ULL);
+      const uint32_t kibs =
+          (us > 0ULL) ? static_cast<uint32_t>(
+                            ((secs * 512ULL / 1024ULL) * 1000000ULL) / us)
+                      : 0u;
+
+      const uint32_t man_tag =
+          (static_cast<uint32_t>(native_owner_boot_manifest_hash[0]) << 24u) |
+          (static_cast<uint32_t>(native_owner_boot_manifest_hash[1]) << 16u) |
+          (static_cast<uint32_t>(native_owner_boot_manifest_hash[2]) << 8u) |
+          static_cast<uint32_t>(native_owner_boot_manifest_hash[3]);
+
+      const bool all_ok = cache_error == 0 && native_owner_root_accepted == 1 &&
+                          native_owner_cache_stage == 6 &&
+                          native_owner_cache_status == 0 &&
+                          native_owner_cache_native_union == 1 &&
+                          native_owner_boot_manifest_status == 0 &&
+                          launchd_ok == 1 && dyld_ok == 1 && dsc_ok == 1 &&
+                          errs == 0u && vr_errs == 0u && vr_blks > 0u;
+      const bool all_ok =
+          root_ok && errs == 0u && vr_errs == 0u && vr_blks > 0u;
+
+      panic("SM6125-ROOT-MNT ok=%u os=/dev/%s sys=%s union=%d\n"
+            "AUTH root=%d(ap=%d) sys_rc=%d stg=%d man=%d(%08x)\n"
+            "VFS launchd=%d dyld=%d dsc=%d\n"
+            "VR blk=%u err=%u IO req=%u kib=%u kibs=%u io_err=%u",
+            all_ok ? 1u : 0u, ctrl->os_bsd[0] ? ctrl->os_bsd : "none",
+            native_owner_cache_device_path[0] ? native_owner_cache_device_path
+                                              : "none",
+            native_owner_cache_native_union, native_owner_root_accepted,
+            native_owner_root_apple_autherr, cache_error,
+            native_owner_cache_stage, native_owner_boot_manifest_status,
+            man_tag, launchd_ok, dyld_ok, dsc_ok, vr_blks, vr_errs, reqs, kib,
+            kibs, errs);
+    }
+
+    extern "C" void sm6125_emmc_post_data_mount_check(
+        int data_error, int vfs_err, uint32_t prev_boot, uint32_t cur_boot,
+        int readback_ok) {
+      Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
+      if (!ctrl || ctrl->block_mode != SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG) {
+        return;
+      }
+
+      const unsigned gpt_post = native_ufs_store_gpt_check();
+      const uint32_t errs = __atomic_load_n(&ctrl->io_errors, __ATOMIC_RELAXED);
+      const uint32_t vr_errs =
+          __atomic_load_n(&ctrl->vr_integrity_errors, __ATOMIC_RELAXED);
+      const bool persist_req = ctrl->persist_enabled;
+      const bool persist_ok =
+          !persist_req || (ctrl->persist_window_open &&
+                           (native_data_persist_state == 2u ||
+                            native_data_persist_state == 3u) &&
+                           native_data_persist_gpt == 1u &&
+                           native_data_persist_gpt_after == 1u &&
+                           native_data_persist_errors == 0ULL &&
+                           ctrl->core.write_req_count > 0ULL &&
+                           ctrl->core.flush_count > 0ULL && gpt_post == 1u);
+
+      const bool all_ok =
+          ctrl->root_check_valid && ctrl->root_cache_err == 0 &&
+          ctrl->root_launchd_ok == 1 && ctrl->root_dyld_ok == 1 &&
+          ctrl->root_dsc_ok == 1 && data_error == 0 &&
+          native_owner_data_status == 0 && native_owner_data_readonly == 0 &&
+          native_ram_block_ready == 1u && vfs_err == 0 && readback_ok == 1 &&
+          errs == 0u && vr_errs == 0u && gpt_post == 1u && persist_ok;
+
+      panic("SM6125-DATA-MNT ok=%u dev=%s rc=%d stg=%d ro=%d\n"
+            "PERSIST en=%u st=%u hdr=%u wb=%u lba=0x%llx cache=%u\n"
+            "EMMC_WR req=%llu sec=%llu flush=%llu gpt=%u/%u/%u p_err=%llu\n"
+            "VAR_CHK err=%d prev=%u cur=%u rdok=%d io_err=%u vr_err=%u",
+            all_ok ? 1u : 0u,
+            native_owner_data_device_path[0] ? native_owner_data_device_path
+                                             : "none",
+            data_error, native_owner_data_stage, native_owner_data_readonly,
+            persist_req ? 1u : 0u, native_data_persist_state,
+            native_data_persist_header, native_data_write_back,
+            native_data_persist_first_lba, ctrl->core.has_cache_ctrl ? 1u : 0u,
+            ctrl->core.write_req_count, ctrl->core.write_sectors_total,
+            ctrl->core.flush_count, native_data_persist_gpt,
+            native_data_persist_gpt_after, gpt_post, native_data_persist_errors,
+            vfs_err, prev_boot, cur_boot, readback_ok, errs, vr_errs);
+    }

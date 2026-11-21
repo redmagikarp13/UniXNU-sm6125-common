@@ -156,7 +156,13 @@ def make_late_object(obj_path: Path, source_filename: str) -> Path:
     return late_path
 
 
-def audit_storage_vtable(base_obj: Path, block_obj: Path) -> int:
+def audit_storage_vtable(
+    base_obj: Path,
+    block_obj: Path,
+    vtable_sym: str = '__ZTV15Sm6125EmmcBlock',
+    class_prefix: str = '15Sm6125EmmcBlock',
+    class_label: str = 'Sm6125EmmcBlock',
+) -> int:
     dwarf = subprocess.check_output(
         ['xcrun', 'dwarfdump', '--name=IOBlockStorageDevice', '--show-children', str(base_obj)],
         text=True,
@@ -174,17 +180,17 @@ def audit_storage_vtable(base_obj: Path, block_obj: Path) -> int:
     base_raw = base_obj.read_bytes()
     block_raw = block_obj.read_bytes()
     base_slots = extract_vtable_slots(base_raw, macho(base_raw), '__ZTV20IOBlockStorageDevice', 190)
-    block_slots = extract_vtable_slots(block_raw, macho(block_raw), '__ZTV15Sm6125EmmcBlock', 190)
+    block_slots = extract_vtable_slots(block_raw, macho(block_raw), vtable_sym, 190)
     require(base_slots.count('___cxa_pure_virtual') == 14, 'Expected 14 pure-virtual slots in IOBlockStorageDevice')
-    require('___cxa_pure_virtual' not in block_slots, 'Sm6125EmmcBlock left an unimplemented pure-virtual slot')
+    require('___cxa_pure_virtual' not in block_slots, f'{class_label} left an unimplemented pure-virtual slot')
 
     overrides = 0
     for idx, (expected, actual) in enumerate(zip(base_slots, block_slots)):
-        own = actual.startswith(('__ZN15Sm6125EmmcBlock', '__ZNK15Sm6125EmmcBlock'))
+        own = actual.startswith((f'__ZN{class_prefix}', f'__ZNK{class_prefix}'))
         if expected == '___cxa_pure_virtual':
-            require(own, f'Slot {idx} is pure virtual in IOBlockStorageDevice and not overridden by Sm6125EmmcBlock')
+            require(own, f'Slot {idx} is pure virtual in IOBlockStorageDevice and not overridden by {class_label}')
         elif actual != expected:
-            require(own, f'Slot {idx} mismatch: expected {expected} or Sm6125EmmcBlock override, got {actual}')
+            require(own, f'Slot {idx} mismatch: expected {expected} or {class_label} override, got {actual}')
         if own:
             overrides += 1
     return overrides
@@ -336,6 +342,14 @@ def main() -> None:
     shng_src = probe_dir / 'Sm6125ShngRoot.c'
     cpp_src = probe_dir / 'Sm6125EmmcProbe.cpp'
     blk_src = probe_dir / 'Sm6125EmmcBlock.cpp'
+    ram_dir = (ROOT / 'drivers/RamBlock').resolve()
+    if not (ram_dir / 'NativeRamBlock.cpp').is_file():
+        for parent in ROOT.parents:
+            if (parent / 'drivers/RamBlock/NativeRamBlock.cpp').is_file():
+                ram_dir = (parent / 'drivers/RamBlock').resolve()
+                break
+    ram_src = ram_dir / 'NativeRamBlock.cpp'
+    require(ram_src.is_file(), f'Missing NativeRamBlock.cpp under {ram_dir}')
     vr_kit = ROOT / 'kits/VerifiedRoot'
     if not (vr_kit / 'src/verified_root.c').is_file():
         for parent in ROOT.parents:
@@ -380,6 +394,7 @@ OSDefineOperatorMethods(IOBlockStorageDevice)
     cpp_obj = OUT / 'Sm6125EmmcProbe.o'
     base_obj = OUT / 'IOBlockStorageDevice.o'
     blk_obj = OUT / 'Sm6125EmmcBlock.o'
+    ram_obj = OUT / 'NativeRamBlock.o'
 
     obj_root = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837'
     c_record = obj_root / 'bsd/DEVELOPMENT/bsd_init.o.json'
@@ -416,15 +431,29 @@ OSDefineOperatorMethods(IOBlockStorageDevice)
         blk_obj,
         [*common_warnings, '-Wno-deprecated-declarations', *storage_includes],
     )
+    replay_compile(
+        cpp_record,
+        ram_src,
+        ram_obj,
+        [*common_warnings, '-Wno-deprecated-declarations', '-Wno-error', '-I', str(ram_dir), *storage_includes],
+    )
 
     check_object(base_obj.read_bytes(), base_obj.stem)
     check_object(blk_obj.read_bytes(), blk_obj.stem)
+    check_object(ram_obj.read_bytes(), ram_obj.stem)
     overrides = audit_storage_vtable(base_obj, blk_obj)
+    ram_overrides = audit_storage_vtable(
+        base_obj, ram_obj, '__ZTV14NativeRamBlock', '14NativeRamBlock', 'NativeRamBlock',
+    )
 
     base_late_obj = make_late_object(base_obj, 'IOBlockStorageDevice.cpp')
     blk_late_obj = make_late_object(blk_obj, 'Sm6125EmmcBlock.cpp')
+    ram_late_obj = make_late_object(ram_obj, 'NativeRamBlock.cpp')
 
-    final_objs = [ro_obj, core_obj, shng_obj, vr_obj, crypto_obj, pol_obj, cpp_obj, base_late_obj, blk_late_obj]
+    final_objs = [
+        ro_obj, core_obj, shng_obj, vr_obj, crypto_obj, pol_obj, cpp_obj,
+        base_late_obj, blk_late_obj, ram_late_obj,
+    ]
     audit_object_sections_and_disasm(final_objs, cpp_obj)
 
     archive = OUT / 'libSm6125EmmcProbe.a'
@@ -447,15 +476,17 @@ OSDefineOperatorMethods(IOBlockStorageDevice)
         'shng_source_sha256': hashlib.sha256(shng_src.read_bytes()).hexdigest(),
         'cpp_source_sha256': hashlib.sha256(cpp_src.read_bytes()).hexdigest(),
         'blk_source_sha256': hashlib.sha256(blk_src.read_bytes()).hexdigest(),
+        'ram_source_sha256': hashlib.sha256(ram_src.read_bytes()).hexdigest(),
         'iostorage_revision': IOSTORAGEFAMILY_REVISION,
         'verified_root_policies': policy_report,
         'vtable_slots_checked': 190,
         'vtable_overrides': overrides,
+        'ram_vtable_overrides': ram_overrides,
         'archive_sha256': digest,
-        'mode': 'SM6125 GCC SDCC1 + SDHCI-MSM v5 probe & VerifiedRoot IOBlockStorageDevice DDR52/ADMA2 RO driver',
+        'mode': 'SM6125 GCC SDCC1 + SDHCI-MSM v5 probe, VerifiedRoot OS+SystemOS, and NativeRamBlock Data store',
     }
     (OUT / 'build-report.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
-    print(f'PASS: Sm6125EmmcProbe+Block ({archive} sha256 {digest}, 190 vtable slots, {overrides} overrides)')
+    print(f'PASS: Sm6125EmmcProbe+Block+Data ({archive} sha256 {digest}, 190 vtable slots, {overrides}+{ram_overrides} overrides)')
 
 
 if __name__ == '__main__':

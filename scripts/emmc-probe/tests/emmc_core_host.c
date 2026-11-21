@@ -109,6 +109,18 @@ typedef struct {
   bool inject_skip_ddr52_cap;
   bool card_selected;
 
+  /* Tail write simulation & cache model */
+  bool allow_write_cmds;
+  bool simulate_cache_ctrl;
+  bool inject_write_r1_err;
+  bool inject_flush_switch_err;
+  uint64_t tail_lba_base;
+  uint32_t tail_sector_count;
+  uint32_t write_cmd_count;
+  uint32_t flush_cmd_count;
+  uint8_t tail_nvm[512u * 512u];
+  uint8_t tail_staged[512u * 512u];
+
   /* Sequencing tracking */
   bool saw_vendor_spec_por_pad;
   bool saw_pwrsave_clear;
@@ -217,6 +229,10 @@ static void init_hw_from_real_gpt(void) {
   g_hw.ext_csd[192] = 0x08u; /* EXT_CSD_REV */
   g_hw.ext_csd[196] = 0x57u; /* DEVICE_TYPE */
   put_le32(&g_hw.ext_csd[212], (uint32_t)TEST_SECTORS);
+  g_hw.tail_lba_base = 0x02438000ULL;
+  g_hw.tail_sector_count = 512u;
+  memset(g_hw.tail_nvm, 0, sizeof(g_hw.tail_nvm));
+  memset(g_hw.tail_staged, 0, sizeof(g_hw.tail_staged));
 
   assert(g_gpt_real_len == 65536u);
   memcpy(g_hw.gpt_primary, g_gpt_real, g_gpt_real_len);
@@ -290,6 +306,11 @@ static void load_sector_for_lba(uint32_t lba, uint8_t out[512]) {
     }
   } else if (lba == (uint32_t)BAK_GPT_LBA) {
     memcpy(out, g_hw.gpt_backup, 512u);
+  } else if (g_hw.tail_sector_count > 0u &&
+             lba >= g_hw.tail_lba_base &&
+             lba < g_hw.tail_lba_base + g_hw.tail_sector_count) {
+    const size_t idx = (size_t)(lba - g_hw.tail_lba_base);
+    memcpy(out, g_hw.tail_nvm + idx * 512u, 512u);
   } else if (lba >= 0x01298000u && lba <= 0x0747BFDEu) {
     fill_synth_sector(lba, out);
     if (g_hw.inject_ddr_bitflip && (g_hw.host_control2 & 0x7u) == 4u && lba == 0x01298100u) {
@@ -319,6 +340,13 @@ static void dispatch_command(uint16_t cmd_reg) {
     case 17u:
     case 18u:
       break;
+    case 24u:
+    case 25u:
+      if (!g_hw.allow_write_cmds) {
+        fprintf(stderr, "FORBIDDEN EMMC WRITE CMD %u LBA 0x%08x\n", cmd, g_hw.argument);
+        abort();
+      }
+      break;
     default:
       fprintf(stderr, "FORBIDDEN EMMC CMD %u\n", cmd);
       abort();
@@ -330,7 +358,8 @@ static void dispatch_command(uint16_t cmd_reg) {
   assert((g_hw.clock_control & 0x0007u) == 0x0007u);
 
   if (cmd == 2u || cmd == 3u || cmd == 6u || cmd == 7u || cmd == 8u ||
-      cmd == 9u || cmd == 13u || cmd == 17u || cmd == 18u) {
+      cmd == 9u || cmd == 13u || cmd == 17u || cmd == 18u ||
+      cmd == 24u || cmd == 25u) {
     assert((flags & 0x08u) != 0u); /* CRC check must ALWAYS be enabled */
   }
 
@@ -413,6 +442,15 @@ static void dispatch_command(uint16_t cmd_reg) {
           g_hw.ext_csd[183] = 0x06u;
           g_hw.cmd13_prg_polls = 2u;
         }
+      } else if (g_hw.argument == 0x03200100u) {
+        assert(g_hw.allow_write_cmds);
+        g_hw.flush_cmd_count++;
+        if (g_hw.inject_flush_switch_err) {
+          g_hw.pending_switch_err = true;
+        } else {
+          memcpy(g_hw.tail_nvm, g_hw.tail_staged, sizeof(g_hw.tail_nvm));
+          g_hw.cmd13_prg_polls = 2u;
+        }
       } else {
         fprintf(stderr, "FORBIDDEN EMMC CMD6 ARG 0x%08x\n", g_hw.argument);
         abort();
@@ -426,8 +464,11 @@ static void dispatch_command(uint16_t cmd_reg) {
         g_hw.cmd13_prg_polls--;
         g_hw.resp[0] = 0x00000E00u; /* PRG, not ready */
       } else {
-        g_hw.resp[0] = 0x00000900u | (g_hw.pending_switch_err ? 0x00000080u : 0u);
+        g_hw.resp[0] = 0x00000900u |
+                       (g_hw.pending_switch_err ? 0x00000080u : 0u) |
+                       (g_hw.inject_write_r1_err ? 0x04000000u : 0u); /* WP_VIOLATION */
         g_hw.pending_switch_err = false;
+        g_hw.inject_write_r1_err = false;
       }
       break;
     case 8u:
@@ -578,6 +619,53 @@ static void dispatch_command(uint16_t cmd_reg) {
         g_hw.data_cache_stale = true;
         g_hw.int_status |= 0x00000003u; /* CC + TC */
       }
+      break;
+    }
+    case 24u:
+    case 25u: {
+      assert(g_hw.allow_write_cmds);
+      assert((flags & 0x20u) != 0u);
+      const uint16_t expect_bc = (cmd == 24u) ? 1u : g_hw.block_count;
+      assert(g_hw.block_size == 512u && g_hw.block_count == expect_bc &&
+             g_hw.block_count >= 1u && g_hw.block_count <= SIM_XFER_MAX_SECTORS);
+      if (cmd == 24u) {
+        assert(g_hw.transfer_mode == 0x0001u);
+      } else {
+        assert(g_hw.transfer_mode == 0x0027u);
+      }
+      assert((g_hw.host_control & 0x3Cu) == 0x34u);
+      assert(g_hw.adma_address_hi == 0u);
+      assert(g_hw.adma_address == (uint32_t)SIM_DESC_PA);
+      assert(!g_hw.desc_cpu_dirty);
+      assert(!g_hw.data_cpu_dirty);
+      assert(g_hw.argument >= g_hw.tail_lba_base);
+      assert((uint64_t)g_hw.argument + g_hw.block_count <=
+             g_hw.tail_lba_base + g_hw.tail_sector_count);
+
+      const uint16_t attr = dma_rd_le16(g_hw.sim_desc_dram + 0u);
+      const uint16_t len = dma_rd_le16(g_hw.sim_desc_dram + 2u);
+      const uint32_t addr = le32(g_hw.sim_desc_dram + 4u);
+      assert(attr == 0x0023u);
+      assert(len == g_hw.block_count * 512u);
+      assert(addr == (uint32_t)SIM_DATA_PA);
+
+      g_hw.resp[0] = 0x00000900u;
+      if (g_hw.inject_adma_err) {
+        g_hw.adma_error = 0x05u;
+        g_hw.int_status |= 0x02008001u;
+        break;
+      }
+      const size_t off = (size_t)(g_hw.argument - g_hw.tail_lba_base) * 512u;
+      memcpy(g_hw.tail_staged + off, g_hw.sim_data_dram, len);
+      if (!g_hw.simulate_cache_ctrl) {
+        memcpy(g_hw.tail_nvm + off, g_hw.sim_data_dram, len);
+      }
+      if (g_hw.inject_adma_canary_overrun) {
+        g_hw.sim_data_dram[SIM_XFER_BUF_BYTES] = 0x00u;
+      }
+      g_hw.cmd13_prg_polls = 2u;
+      g_hw.write_cmd_count++;
+      g_hw.int_status |= 0x00000003u;
       break;
     }
     default:
@@ -1360,6 +1448,148 @@ static int test_ctrl_and_shngroot_suite(void) {
   return 26;
 }
 
+static int test_write_sandbox_suite(void) {
+  init_hw_from_real_gpt();
+  g_hw.block_sdhci_if_clocks_off = true;
+  g_hw.simulate_cache_ctrl = true;
+  g_hw.ext_csd[33] = 0x01u;
+  g_hw.ext_csd[249] = 0x00u;
+  g_hw.ext_csd[250] = 0x08u; /* 2 MiB volatile cache */
+
+  sm6125_emmc_dma_buf_t dma = make_sim_dma_buf();
+  sm6125_emmc_ctrl_t ctrl;
+  assert(sm6125_emmc_ctrl_init(
+             &ctrl, &g_hw_ops, (uintptr_t)&g_hw, (uintptr_t)&g_hw + 0x1000u, &dma) ==
+         SM6125_EMMC_RC_OK);
+  assert(ctrl.has_cache_ctrl);
+  assert(!ctrl.shngroot_bounds_set && !ctrl.write_window_armed);
+
+  uint8_t sec[512];
+  memset(sec, 0x5Cu, sizeof(sec));
+
+  /* Reads-only mode: before sandbox configuration every write/flush is refused without touching SDHCI */
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, g_hw.tail_lba_base, 1u, sec) ==
+         SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(sm6125_emmc_ctrl_set_write_window(&ctrl, g_hw.tail_lba_base, g_hw.tail_lba_base + 511ULL) ==
+         SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(sm6125_emmc_ctrl_flush_cache(&ctrl) == SM6125_EMMC_RC_WRITE_PROTECTED);
+
+  /* Invalid SHNGROOT bounds refused */
+  assert(sm6125_emmc_ctrl_set_shngroot_bounds(&ctrl, 0ULL) == SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(sm6125_emmc_ctrl_set_shngroot_bounds(&ctrl, 4095ULL) == SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(sm6125_emmc_ctrl_set_shngroot_bounds(&ctrl, 0x10000000000ULL) ==
+         SM6125_EMMC_RC_WRITE_PROTECTED);
+
+  /* Real SHNGROOT v2 image size: 0x233b00000 B => shngroot_end_lba = 0x02435800 */
+  const uint64_t real_shngroot_bytes = 0x233b00000ULL;
+  assert(sm6125_emmc_ctrl_set_shngroot_bounds(&ctrl, real_shngroot_bytes) == SM6125_EMMC_RC_OK);
+  assert(ctrl.shngroot_first_lba == 0x01298000ULL);
+  assert(ctrl.shngroot_end_lba == 0x02435800ULL);
+
+  /* Write window touching SHNGROOT, guard gap (<+8192), or > userdata_last is refused */
+  assert(sm6125_emmc_ctrl_set_write_window(&ctrl, ctrl.shngroot_first_lba, g_hw.tail_lba_base + 511ULL) ==
+         SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(sm6125_emmc_ctrl_set_write_window(
+             &ctrl, ctrl.shngroot_end_lba + SM6125_EMMC_WRITE_GUARD_SECTORS - 1ULL,
+             g_hw.tail_lba_base + 511ULL) == SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(sm6125_emmc_ctrl_set_write_window(
+             &ctrl, g_hw.tail_lba_base, ctrl.userdata_last + 1ULL) == SM6125_EMMC_RC_WRITE_PROTECTED);
+
+  /* Arm exact tail window [tail_lba_base, tail_lba_base + 511] */
+  assert(sm6125_emmc_ctrl_set_write_window(
+             &ctrl, g_hw.tail_lba_base, g_hw.tail_lba_base + 511ULL) == SM6125_EMMC_RC_OK);
+
+  /* With allow_write_cmds == false, verify negative LBA checks NEVER issue CMD24/25 */
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, 0ULL, 1u, sec) == SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, 1ULL, 1u, sec) == SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, BAK_GPT_LBA, 1u, sec) == SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, ctrl.userdata_first, 8u, sec) ==
+         SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(sm6125_emmc_ctrl_write_sectors(
+             &ctrl, ctrl.shngroot_end_lba + SM6125_EMMC_WRITE_GUARD_SECTORS - 1ULL, 1u, sec) ==
+         SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, g_hw.tail_lba_base - 1ULL, 2u, sec) ==
+         SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, g_hw.tail_lba_base + 510ULL, 3u, sec) ==
+         SM6125_EMMC_RC_WRITE_PROTECTED);
+  assert(g_hw.write_cmd_count == 0u);
+
+  /* Positive CMD24 single-sector write + CMD25 multi-chunk write + volatile cache + CMD6 FLUSH_CACHE */
+  g_hw.allow_write_cmds = true;
+  fill_synth_sector(0x90000001u, sec);
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, g_hw.tail_lba_base, 1u, sec) == SM6125_EMMC_RC_OK);
+  assert(g_hw.write_cmd_count == 1u && g_hw.cmd13_prg_polls == 0u);
+
+  uint8_t *wbuf = (uint8_t *)malloc(130u * 512u);
+  uint8_t *rbuf = (uint8_t *)malloc(130u * 512u);
+  assert(wbuf != NULL && rbuf != NULL);
+  for (uint32_t s = 0u; s < 130u; s++) {
+    fill_synth_sector(0xA5000000u + s, wbuf + (size_t)s * 512u);
+  }
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, g_hw.tail_lba_base + 8ULL, 130u, wbuf) ==
+         SM6125_EMMC_RC_OK);
+  assert(ctrl.write_req_count == 2ULL && ctrl.write_sectors_total == 131ULL);
+
+  /* Volatile write cache model: before flush_cache, NVM is still zero; after flush_cache, NVM matches */
+  memset(rbuf, 0xFF, 512u);
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, g_hw.tail_lba_base, 1u, rbuf) == SM6125_EMMC_RC_OK);
+  assert(rbuf[0] == 0u);
+
+  assert(sm6125_emmc_ctrl_flush_cache(&ctrl) == SM6125_EMMC_RC_OK);
+  assert(g_hw.flush_cmd_count == 1u && ctrl.flush_count == 1ULL);
+
+  memset(rbuf, 0, 130u * 512u);
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, g_hw.tail_lba_base, 1u, rbuf) == SM6125_EMMC_RC_OK);
+  assert(memcmp(rbuf, sec, 512u) == 0);
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, g_hw.tail_lba_base + 8ULL, 130u, rbuf) ==
+         SM6125_EMMC_RC_OK);
+  assert(memcmp(rbuf, wbuf, 130u * 512u) == 0);
+
+  /* Fault injections on write & flush */
+  g_hw.inject_adma_canary_overrun = true;
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, g_hw.tail_lba_base, 1u, sec) ==
+         SM6125_EMMC_RC_CANARY_CORRUPT);
+  g_hw.inject_adma_canary_overrun = false;
+  memset(dma.data_va + dma.canary_offset, 0xA5, dma.canary_size);
+  memcpy(g_hw.sim_data_dram + dma.canary_offset, dma.data_va + dma.canary_offset, dma.canary_size);
+
+  g_hw.inject_adma_err = true;
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, g_hw.tail_lba_base, 2u, wbuf) ==
+         SM6125_EMMC_RC_ADMA_ERROR);
+  g_hw.inject_adma_err = false;
+
+  g_hw.inject_write_r1_err = true;
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, g_hw.tail_lba_base, 1u, sec) ==
+         SM6125_EMMC_RC_R1_ERROR);
+
+  g_hw.inject_flush_switch_err = true;
+  assert(sm6125_emmc_ctrl_flush_cache(&ctrl) == SM6125_EMMC_RC_SWITCH_ERROR);
+
+  /* Verify no-cache-ctrl mode commits writes and flushes cleanly without CMD6(32,1) */
+  init_hw_from_real_gpt();
+  g_hw.block_sdhci_if_clocks_off = true;
+  g_hw.allow_write_cmds = true;
+  g_hw.simulate_cache_ctrl = false;
+  assert(sm6125_emmc_ctrl_init(
+             &ctrl, &g_hw_ops, (uintptr_t)&g_hw, (uintptr_t)&g_hw + 0x1000u, &dma) ==
+         SM6125_EMMC_RC_OK);
+  assert(!ctrl.has_cache_ctrl);
+  assert(sm6125_emmc_ctrl_set_shngroot_bounds(&ctrl, real_shngroot_bytes) == SM6125_EMMC_RC_OK);
+  assert(sm6125_emmc_ctrl_set_write_window(
+             &ctrl, g_hw.tail_lba_base, g_hw.tail_lba_base + 511ULL) == SM6125_EMMC_RC_OK);
+  assert(sm6125_emmc_ctrl_write_sectors(&ctrl, g_hw.tail_lba_base + 2ULL, 1u, sec) ==
+         SM6125_EMMC_RC_OK);
+  assert(sm6125_emmc_ctrl_flush_cache(&ctrl) == SM6125_EMMC_RC_OK);
+  assert(g_hw.flush_cmd_count == 0u && ctrl.flush_count == 1ULL);
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, g_hw.tail_lba_base + 2ULL, 1u, rbuf) ==
+         SM6125_EMMC_RC_OK);
+  assert(memcmp(rbuf, sec, 512u) == 0);
+
+  free(wbuf);
+  free(rbuf);
+  return 31;
+}
+
 int main(int argc, char **argv) {
   const char *gpt_path = (argc > 1) ? argv[1] : "/Volumes/Leo2/backup-ginkgo/gpt_primary.bin";
   FILE *f = fopen(gpt_path, "rb");
@@ -1373,6 +1603,7 @@ int main(int argc, char **argv) {
   checks += test_error_and_corruption_cases();
   checks += test_fast_bench_suite();
   checks += test_ctrl_and_shngroot_suite();
+  checks += test_write_sandbox_suite();
   printf("emmc_core_host: %d checks passed\n", checks);
   return 0;
 }

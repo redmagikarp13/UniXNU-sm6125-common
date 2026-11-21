@@ -94,6 +94,8 @@ enum {
   SM6125_EMMC_RC_AUTO_CMD_ERROR = -23,
   SM6125_EMMC_RC_CANARY_CORRUPT = -24,
   SM6125_EMMC_RC_DATA_MISMATCH = -25,
+  SM6125_EMMC_RC_WRITE_PROTECTED = -26,
+  SM6125_EMMC_RC_CARD_BUSY = -27,
 };
 
 typedef struct {
@@ -262,6 +264,16 @@ typedef struct {
   uint32_t sec_count;
   uint8_t device_type;
   uint8_t hs_timing;
+  bool has_cache_ctrl;
+  bool shngroot_bounds_set;
+  bool write_window_armed;
+  uint64_t shngroot_first_lba;
+  uint64_t shngroot_end_lba;
+  uint64_t write_min_lba;
+  uint64_t write_max_lba;
+  uint64_t write_req_count;
+  uint64_t write_sectors_total;
+  uint64_t flush_count;
   uint32_t ext_csd_ro_crc;
   uint32_t gpt_parts_crc;
   uint64_t userdata_first;
@@ -271,6 +283,8 @@ typedef struct {
   uint16_t hc2;
   uint32_t ddr_cfg;
 } sm6125_emmc_ctrl_t;
+
+#define SM6125_EMMC_WRITE_GUARD_SECTORS 8192ULL
 
 int32_t sm6125_emmc_ctrl_init(
     sm6125_emmc_ctrl_t *ctrl,
@@ -284,6 +298,24 @@ int32_t sm6125_emmc_ctrl_read_sectors(
     uint64_t lba,
     uint32_t sector_count,
     uint8_t *dst_va);
+
+int32_t sm6125_emmc_ctrl_set_shngroot_bounds(
+    sm6125_emmc_ctrl_t *ctrl,
+    uint64_t shngroot_bytes);
+
+int32_t sm6125_emmc_ctrl_set_write_window(
+    sm6125_emmc_ctrl_t *ctrl,
+    uint64_t first_lba,
+    uint64_t last_lba);
+
+int32_t sm6125_emmc_ctrl_write_sectors(
+    sm6125_emmc_ctrl_t *ctrl,
+    uint64_t lba,
+    uint32_t sector_count,
+    const uint8_t *src_va);
+
+int32_t sm6125_emmc_ctrl_flush_cache(
+    sm6125_emmc_ctrl_t *ctrl);
 
 #ifdef __cplusplus
 }

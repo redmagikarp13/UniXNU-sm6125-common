@@ -45,7 +45,7 @@
  #error Owner image-set metadata is an offline development instrument
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7016,6 +7016,14 @@
+@@ -7016,6 +7016,20 @@
   *		word width of the kernel. Once the self-exec completes, the
   *		initproc might be different.
   */
@@ -57,10 +57,16 @@
 +#define XNU_OWNER_BOOT_MANIFEST 1
 +#undef XNU_OWNER_UNION_SYSTEMOS
 +#define XNU_OWNER_UNION_SYSTEMOS 1
++#undef XNU_OWNER_DATA_MOUNT
++#define XNU_OWNER_DATA_MOUNT 1
++#undef XNU_NATIVE_RAM_BLOCK
++#define XNU_NATIVE_RAM_BLOCK 1
++#undef XNU_OWNER_DATA_VOLUME_UUID
++#define XNU_OWNER_DATA_VOLUME_UUID "F8186F89-F2EA-49D2-AA2E-80FD4A75053F"
  #if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT
  #if !DEVELOPMENT && !DEBUG
  #error The offline owner cache mount is a development instrument
-@@ -7175,6 +7183,24 @@ native_owner_cache_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
+@@ -7175,6 +7189,24 @@ native_owner_cache_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
  	native_owner_cache_authorized = cache_authorized;
  	native_owner_cache_status = error;
  	native_owner_cache_checkpoint(error, cache_authorized);
@@ -81,6 +87,91 @@
 +			vnode_put(vp_dsc);
 +		}
 +		sm6125_emmc_post_mount_check(error, launchd_ok, dyld_ok, dsc_ok);
++	}
+ 	return error;
+ }
+ #endif
+@@ -8044,5 +8076,84 @@ done:
+ 	if (data_root) vnode_put(data_root);
+ 	native_owner_data_status = error;
++	{
++		extern void sm6125_emmc_post_data_mount_check(
++		    int data_error, int vfs_err, uint32_t prev_boot, uint32_t cur_boot, int readback_ok);
++		uint32_t prev_boot = 0, cur_boot = 0;
++		int vfs_err = 0, readback_ok = 0;
++		uint32_t diag_arg = 0;
++		if (error == 0 &&
++		    PE_parse_boot_argn("sm6125-emmc-block", &diag_arg, sizeof(diag_arg)) &&
++		    diag_arg == 2u) {
++			static const char kCheckPath[] = "/private/var/.unixnu-write-check";
++			vfs_context_t ctx = vfs_context_current();
++			vnode_t vp = NULLVP;
++			char buf[32] = {0};
++			int resid = 0;
++			if (vnode_open(kCheckPath, FREAD, 0, 0, &vp, ctx) == 0) {
++				if (vn_rdwr(UIO_READ, vp, buf, (int)sizeof(buf) - 1, 0, UIO_SYSSPACE,
++				    IO_NOAUTH | IO_UNIT, vfs_context_ucred(ctx), &resid,
++				    vfs_context_proc(ctx)) == 0) {
++					const int got = (int)(sizeof(buf) - 1) - resid;
++					if (got >= 29 && memcmp(buf, "UNIXNU-GINKGO-DATA boot=", 24) == 0) {
++						uint32_t v = 0;
++						for (int i = 24; i < 30 && buf[i] >= '0' && buf[i] <= '9'; ++i) {
++							v = v * 10u + (uint32_t)(buf[i] - '0');
++						}
++						prev_boot = v;
++					}
++				}
++				vnode_close(vp, FREAD, ctx);
++				vp = NULLVP;
++			}
++			cur_boot = prev_boot + 1u;
++			char record[32] = {0};
++			snprintf(record, sizeof(record), "UNIXNU-GINKGO-DATA boot=%06u\n", cur_boot);
++			const int rec_len = (int)strlen(record);
++			vfs_err = vnode_open(kCheckPath, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, 0644, 0, &vp, ctx);
++			if (vfs_err == 0) {
++				resid = 0;
++				vfs_err = vn_rdwr(UIO_WRITE, vp, record, rec_len, 0, UIO_SYSSPACE,
++				    IO_NOAUTH | IO_UNIT, vfs_context_ucred(ctx), &resid,
++				    vfs_context_proc(ctx));
++				if (vfs_err == 0 && resid != 0) {
++					vfs_err = EIO;
++				}
++				if (vfs_err == 0) {
++					struct vnode_attr va;
++					VATTR_INIT(&va);
++					VATTR_SET(&va, va_data_size, (uint64_t)rec_len);
++					vfs_err = vnode_setattr(vp, &va, ctx);
++				}
++				if (vfs_err == 0) {
++					vfs_err = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++				}
++				int cls_err = vnode_close(vp, FWRITE, ctx);
++				vp = NULLVP;
++				if (vfs_err == 0) {
++					vfs_err = cls_err;
++				}
++			}
++			if (vfs_err == 0) {
++				vnode_t var_vp = NULLVP;
++				if (vnode_lookup("/private/var", 0, &var_vp, ctx) == 0) {
++					VFS_SYNC(vnode_mount(var_vp), MNT_WAIT, ctx);
++					vnode_put(var_vp);
++				}
++				if (vnode_open(kCheckPath, FREAD, 0, 0, &vp, ctx) == 0) {
++					char verify[32] = {0};
++					resid = 0;
++					if (vn_rdwr(UIO_READ, vp, verify, rec_len, 0, UIO_SYSSPACE,
++					    IO_NOAUTH | IO_UNIT, vfs_context_ucred(ctx), &resid,
++					    vfs_context_proc(ctx)) == 0 &&
++					    resid == 0 && memcmp(verify, record, (size_t)rec_len) == 0) {
++						readback_ok = 1;
++					}
++					vnode_close(vp, FREAD, ctx);
++				}
++			}
++		}
++		sm6125_emmc_post_data_mount_check(error, vfs_err, prev_boot, cur_boot, readback_ok);
 +	}
  	return error;
  }

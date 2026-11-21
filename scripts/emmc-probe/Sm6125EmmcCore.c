@@ -27,7 +27,9 @@ enum {
   SDHCI_CMD_DATA = 0x20u,
 
   SDHCI_TM_READ = 0x0010u,
+  SDHCI_TM_SINGLE_WRITE_ADMA = 0x0001u,
   SDHCI_TM_SINGLE_ADMA = 0x0011u,
+  SDHCI_TM_MULTI_WRITE_ADMA = 0x0027u,
   SDHCI_TM_MULTI_PIO = 0x0036u,
   SDHCI_TM_MULTI_ADMA = 0x0037u,
 
@@ -897,42 +899,29 @@ static void record_fast_fail(
   }
 }
 
-static int32_t mmc_switch_cmd6(
+static int32_t wait_card_tran_ready(
     const sm6125_emmc_hw_ops_t *ops,
     uintptr_t sdhci_va,
-    uint8_t index,
-    uint8_t value,
+    unsigned max_polls,
+    uint32_t poll_delay_us,
+    uint32_t extra_err_mask,
+    bool switch_mode,
     cmd_fail_t *fail) {
-  /* Hard defense-in-depth allowlist: ONLY HS_TIMING=1 and BUS_WIDTH=2|6 */
-  const bool allowed = (index == 185u && value == 1u) ||
-                       (index == 183u && (value == 2u || value == 6u));
-  if (!allowed) {
-    return SM6125_EMMC_RC_BAD_ARG;
-  }
-  const uint32_t arg = (0x03u << 24u) | ((uint32_t)index << 16u) | ((uint32_t)value << 8u);
-  int32_t rc = send_cmd_pio(
-      ops, sdhci_va, 6u, arg,
-      (uint8_t)(SDHCI_CMD_INDEX | SDHCI_CMD_CRC | SDHCI_CMD_RESP_SHORT),
-      false, NULL, NULL, fail);
-  if (rc != SM6125_EMMC_RC_OK) {
-    return rc;
-  }
-
-  for (unsigned i = 0u; i < 5000u; i++) {
+  for (unsigned i = 0u; i < max_polls; i++) {
     uint32_t r0 = 0u;
-    rc = send_cmd_pio(
+    const int32_t rc = send_cmd_pio(
         ops, sdhci_va, 13u, 0x00010000u,
         (uint8_t)(SDHCI_CMD_INDEX | SDHCI_CMD_CRC | SDHCI_CMD_RESP_SHORT),
         false, &r0, NULL, fail);
     if (rc != SM6125_EMMC_RC_OK) {
       return rc;
     }
-    if ((r0 & (MMC_R1_ERR_MASK | MMC_R1_SWITCH_ERROR)) != 0u) {
+    if ((r0 & (MMC_R1_ERR_MASK | extra_err_mask)) != 0u) {
       latch_cmd_fail(fail, 13u, 0x00010000u, 0x0D1Au,
                      ops->read32(sdhci_va, SM6125_SDHCI_INT_STATUS),
                      ops->read32(sdhci_va, SM6125_SDHCI_PRESENT_STATE),
                      r0, 0u, 0u);
-      return SM6125_EMMC_RC_SWITCH_ERROR;
+      return switch_mode ? SM6125_EMMC_RC_SWITCH_ERROR : SM6125_EMMC_RC_R1_ERROR;
     }
     const uint32_t ps = ops->read32(sdhci_va, SM6125_SDHCI_PRESENT_STATE);
     if ((r0 & MMC_R1_STATE_MASK) == MMC_R1_STATE_TRAN &&
@@ -940,9 +929,37 @@ static int32_t mmc_switch_cmd6(
         (ps & SDHCI_PRESENT_DAT0) != 0u) {
       return SM6125_EMMC_RC_OK;
     }
-    ops->delay_us(10u);
+    ops->delay_us(poll_delay_us);
   }
-  return SM6125_EMMC_RC_CMD_TIMEOUT;
+  return switch_mode ? SM6125_EMMC_RC_CMD_TIMEOUT : SM6125_EMMC_RC_CARD_BUSY;
+}
+
+static int32_t mmc_switch_cmd6(
+    const sm6125_emmc_hw_ops_t *ops,
+    uintptr_t sdhci_va,
+    uint8_t index,
+    uint8_t value,
+    cmd_fail_t *fail) {
+  /* Hard defense-in-depth allowlist: HS_TIMING=1, BUS_WIDTH=2|6, FLUSH_CACHE=1 */
+  const bool is_flush = (index == 32u && value == 1u);
+  const bool allowed = (index == 185u && value == 1u) ||
+                       (index == 183u && (value == 2u || value == 6u)) ||
+                       is_flush;
+  if (!allowed) {
+    return SM6125_EMMC_RC_BAD_ARG;
+  }
+  const uint32_t arg = (0x03u << 24u) | ((uint32_t)index << 16u) | ((uint32_t)value << 8u);
+  const int32_t rc = send_cmd_pio(
+      ops, sdhci_va, 6u, arg,
+      (uint8_t)(SDHCI_CMD_INDEX | SDHCI_CMD_CRC | SDHCI_CMD_RESP_SHORT),
+      false, NULL, NULL, fail);
+  if (rc != SM6125_EMMC_RC_OK) {
+    return rc;
+  }
+
+  return wait_card_tran_ready(
+      ops, sdhci_va, is_flush ? 50000u : 5000u, 10u,
+      MMC_R1_SWITCH_ERROR, true, fail);
 }
 
 static int32_t switch_controller_bus_speed(
@@ -1127,23 +1144,26 @@ static bool dma_buf_valid(const sm6125_emmc_dma_buf_t *dma) {
   return true;
 }
 
-static int32_t read_multi_adma(
+static int32_t adma_xfer_chunk(
     const sm6125_emmc_hw_ops_t *ops,
     uintptr_t sdhci_va,
     const sm6125_emmc_dma_buf_t *dma,
     uint64_t lba,
     uint16_t block_count,
+    bool is_write,
     bool poison_data,
-    uint8_t *dst_out,
-    uint32_t *running_crc,
-    uint32_t *remaining_crc_bytes,
+    const uint8_t *src_in,
     cmd_fail_t *fail) {
   if (lba > 0xFFFFFFFFULL || block_count == 0u || block_count > XFER_MAX_SECTORS) {
     return SM6125_EMMC_RC_BAD_ARG;
   }
   const uint32_t total_bytes = (uint32_t)block_count * 512u;
-  const uint32_t cmd_idx = (block_count == 1u) ? 17u : 18u;
-  const uint16_t tm_reg = (block_count == 1u) ? SDHCI_TM_SINGLE_ADMA : SDHCI_TM_MULTI_ADMA;
+  const uint32_t cmd_idx = is_write
+      ? ((block_count == 1u) ? 24u : 25u)
+      : ((block_count == 1u) ? 17u : 18u);
+  const uint16_t tm_reg = is_write
+      ? ((block_count == 1u) ? SDHCI_TM_SINGLE_WRITE_ADMA : SDHCI_TM_MULTI_WRITE_ADMA)
+      : ((block_count == 1u) ? SDHCI_TM_SINGLE_ADMA : SDHCI_TM_MULTI_ADMA);
   const uint16_t cmd_reg =
       (uint16_t)((cmd_idx << 8u) | SDHCI_CMD_DATA | SDHCI_CMD_INDEX | SDHCI_CMD_CRC | SDHCI_CMD_RESP_SHORT);
 
@@ -1156,7 +1176,12 @@ static int32_t read_multi_adma(
     return rc;
   }
 
-  if (poison_data) {
+  if (is_write) {
+    if (!src_in) {
+      return SM6125_EMMC_RC_BAD_ARG;
+    }
+    copy_buf(dma->data_va, src_in, total_bytes);
+  } else if (poison_data) {
     fill_buf(dma->data_va, 0x5Au, total_bytes);
   }
   wr_le16(dma->desc_va + 0u, 0x0023u); /* TRAN | END | VALID */
@@ -1224,7 +1249,11 @@ static int32_t read_multi_adma(
   }
 
   ops->write32(sdhci_va, SM6125_SDHCI_INT_STATUS, is);
-  dma->cache_invalidate_data(dma->cache_ctx, 0u, dma->canary_offset + dma->canary_size);
+  if (is_write) {
+    dma->cache_invalidate_data(dma->cache_ctx, dma->canary_offset, dma->canary_size);
+  } else {
+    dma->cache_invalidate_data(dma->cache_ctx, 0u, dma->canary_offset + dma->canary_size);
+  }
 
   for (size_t i = 0u; i < dma->canary_size; i++) {
     if (dma->data_va[dma->canary_offset + i] != 0xA5u) {
@@ -1233,6 +1262,30 @@ static int32_t read_multi_adma(
     }
   }
 
+  if (is_write) {
+    return wait_card_tran_ready(ops, sdhci_va, 50000u, 10u, 0u, false, fail);
+  }
+  return SM6125_EMMC_RC_OK;
+}
+
+static int32_t read_multi_adma(
+    const sm6125_emmc_hw_ops_t *ops,
+    uintptr_t sdhci_va,
+    const sm6125_emmc_dma_buf_t *dma,
+    uint64_t lba,
+    uint16_t block_count,
+    bool poison_data,
+    uint8_t *dst_out,
+    uint32_t *running_crc,
+    uint32_t *remaining_crc_bytes,
+    cmd_fail_t *fail) {
+  const int32_t rc = adma_xfer_chunk(
+      ops, sdhci_va, dma, lba, block_count, false, poison_data, NULL, fail);
+  if (rc != SM6125_EMMC_RC_OK) {
+    return rc;
+  }
+
+  const uint32_t total_bytes = (uint32_t)block_count * 512u;
   if (dst_out) {
     copy_buf(dst_out, dma->data_va, total_bytes);
   }
@@ -1895,6 +1948,10 @@ int32_t sm6125_emmc_ctrl_init(
     return rc;
   }
   ctrl->hs_timing = ext_csd[185];
+  ctrl->has_cache_ctrl =
+      (ext_csd[33] & 1u) != 0u &&
+      ((uint32_t)ext_csd[249] | (uint32_t)ext_csd[250] |
+       (uint32_t)ext_csd[251] | (uint32_t)ext_csd[252]) != 0u;
   if (ext_csd[185] != 1u || crc32_bytes(&ext_csd[192], 320u) != meta.ext_csd_ro_crc) {
     ctrl->last_rc = SM6125_EMMC_RC_EXT_CSD_MISMATCH;
     return SM6125_EMMC_RC_EXT_CSD_MISMATCH;
@@ -2022,4 +2079,149 @@ int32_t sm6125_emmc_ctrl_read_sectors(
   }
   ctrl->last_rc = SM6125_EMMC_RC_OK;
   return SM6125_EMMC_RC_OK;
+}
+
+static bool ctrl_adma_ready(const sm6125_emmc_ctrl_t *ctrl) {
+  return ctrl && ctrl->online && ctrl->ops && ctrl->has_dma &&
+         (ctrl->active_mode == SM6125_EMMC_FAST_MODE_DDR52_ADMA ||
+          ctrl->active_mode == SM6125_EMMC_FAST_MODE_HS50_ADMA);
+}
+
+int32_t sm6125_emmc_ctrl_set_shngroot_bounds(
+    sm6125_emmc_ctrl_t *ctrl,
+    uint64_t shngroot_bytes) {
+  if (!ctrl || !ctrl->online) {
+    return SM6125_EMMC_RC_BAD_ARG;
+  }
+  ctrl->shngroot_bounds_set = false;
+  ctrl->write_window_armed = false;
+  ctrl->shngroot_first_lba = 0u;
+  ctrl->shngroot_end_lba = 0u;
+  ctrl->write_min_lba = 0u;
+  ctrl->write_max_lba = 0u;
+
+  if (shngroot_bytes == 0u || (shngroot_bytes & 511ULL) != 0u ||
+      ctrl->userdata_first < 34ULL || ctrl->userdata_last < ctrl->userdata_first ||
+      ctrl->userdata_last >= (uint64_t)ctrl->sec_count) {
+    ctrl->last_rc = SM6125_EMMC_RC_WRITE_PROTECTED;
+    return SM6125_EMMC_RC_WRITE_PROTECTED;
+  }
+
+  const uint64_t shng_sectors = shngroot_bytes / 512ULL;
+  const uint64_t userdata_sectors = (ctrl->userdata_last - ctrl->userdata_first) + 1ULL;
+  if (shng_sectors >= userdata_sectors ||
+      userdata_sectors - shng_sectors <= SM6125_EMMC_WRITE_GUARD_SECTORS) {
+    ctrl->last_rc = SM6125_EMMC_RC_WRITE_PROTECTED;
+    return SM6125_EMMC_RC_WRITE_PROTECTED;
+  }
+
+  ctrl->shngroot_first_lba = ctrl->userdata_first;
+  ctrl->shngroot_end_lba = ctrl->userdata_first + shng_sectors;
+  ctrl->shngroot_bounds_set = true;
+  ctrl->last_rc = SM6125_EMMC_RC_OK;
+  return SM6125_EMMC_RC_OK;
+}
+
+int32_t sm6125_emmc_ctrl_set_write_window(
+    sm6125_emmc_ctrl_t *ctrl,
+    uint64_t first_lba,
+    uint64_t last_lba) {
+  if (!ctrl || !ctrl->online || !ctrl->shngroot_bounds_set) {
+    if (ctrl) {
+      ctrl->write_window_armed = false;
+      ctrl->last_rc = SM6125_EMMC_RC_WRITE_PROTECTED;
+    }
+    return SM6125_EMMC_RC_WRITE_PROTECTED;
+  }
+  ctrl->write_window_armed = false;
+  ctrl->write_min_lba = 0u;
+  ctrl->write_max_lba = 0u;
+
+  if (ctrl->userdata_first < 34ULL || ctrl->userdata_last < ctrl->userdata_first ||
+      ctrl->userdata_last >= (uint64_t)ctrl->sec_count) {
+    ctrl->last_rc = SM6125_EMMC_RC_WRITE_PROTECTED;
+    return SM6125_EMMC_RC_WRITE_PROTECTED;
+  }
+
+  const uint64_t min_allowed = ctrl->shngroot_end_lba + SM6125_EMMC_WRITE_GUARD_SECTORS;
+  if (min_allowed > ctrl->userdata_last ||
+      first_lba > last_lba ||
+      first_lba < min_allowed ||
+      last_lba > ctrl->userdata_last) {
+    ctrl->last_rc = SM6125_EMMC_RC_WRITE_PROTECTED;
+    return SM6125_EMMC_RC_WRITE_PROTECTED;
+  }
+
+  ctrl->write_min_lba = first_lba;
+  ctrl->write_max_lba = last_lba;
+  ctrl->write_window_armed = true;
+  ctrl->last_rc = SM6125_EMMC_RC_OK;
+  return SM6125_EMMC_RC_OK;
+}
+
+int32_t sm6125_emmc_ctrl_write_sectors(
+    sm6125_emmc_ctrl_t *ctrl,
+    uint64_t lba,
+    uint32_t sector_count,
+    const uint8_t *src_va) {
+  if (!ctrl || !ctrl->online || !ctrl->ops || !src_va || sector_count == 0u ||
+      !ctrl_adma_ready(ctrl)) {
+    return SM6125_EMMC_RC_BAD_ARG;
+  }
+  if (!ctrl->shngroot_bounds_set || !ctrl->write_window_armed ||
+      ctrl->userdata_first < 34ULL ||
+      ctrl->write_min_lba < ctrl->shngroot_end_lba + SM6125_EMMC_WRITE_GUARD_SECTORS ||
+      ctrl->write_max_lba > ctrl->userdata_last ||
+      lba < ctrl->write_min_lba ||
+      lba > ctrl->write_max_lba ||
+      (uint64_t)sector_count - 1ULL > ctrl->write_max_lba - lba) {
+    ctrl->last_rc = SM6125_EMMC_RC_WRITE_PROTECTED;
+    return SM6125_EMMC_RC_WRITE_PROTECTED;
+  }
+
+  cmd_fail_t fail;
+  zero_buf(&fail, sizeof(fail));
+
+  for (uint32_t done = 0u; done < sector_count;) {
+    const uint32_t left = sector_count - done;
+    const uint16_t chunk = (uint16_t)(left < XFER_MAX_SECTORS ? left : XFER_MAX_SECTORS);
+    const uint8_t *chunk_src = src_va + (size_t)done * 512u;
+    const int32_t rc = adma_xfer_chunk(
+        ctrl->ops, ctrl->sdhci_va, &ctrl->dma,
+        lba + done, chunk, true, false, chunk_src, &fail);
+    if (rc != SM6125_EMMC_RC_OK) {
+      ctrl->last_rc = rc;
+      return rc;
+    }
+    done += chunk;
+  }
+  ctrl->write_req_count += 1ULL;
+  ctrl->write_sectors_total += (uint64_t)sector_count;
+  ctrl->last_rc = SM6125_EMMC_RC_OK;
+  return SM6125_EMMC_RC_OK;
+}
+
+int32_t sm6125_emmc_ctrl_flush_cache(sm6125_emmc_ctrl_t *ctrl) {
+  if (!ctrl || !ctrl->online || !ctrl->ops) {
+    return SM6125_EMMC_RC_BAD_ARG;
+  }
+  if (!ctrl->shngroot_bounds_set || !ctrl->write_window_armed) {
+    ctrl->last_rc = SM6125_EMMC_RC_WRITE_PROTECTED;
+    return SM6125_EMMC_RC_WRITE_PROTECTED;
+  }
+
+  cmd_fail_t fail;
+  zero_buf(&fail, sizeof(fail));
+  int32_t rc = SM6125_EMMC_RC_OK;
+  if (ctrl->has_cache_ctrl) {
+    rc = mmc_switch_cmd6(ctrl->ops, ctrl->sdhci_va, 32u, 1u, &fail);
+  } else {
+    rc = wait_card_tran_ready(
+        ctrl->ops, ctrl->sdhci_va, 50000u, 10u, 0u, false, &fail);
+  }
+  ctrl->last_rc = rc;
+  if (rc == SM6125_EMMC_RC_OK) {
+    ctrl->flush_count += 1ULL;
+  }
+  return rc;
 }
