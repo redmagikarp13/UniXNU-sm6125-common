@@ -1,0 +1,8 @@
+schema_version = 2
+
+[soc]
+name = "sm6125"
+description = "Qualcomm SM6125 (Trinket / Nicobar, Snapdragon 665, Kryo 260 ARMv8.0-A)"
+
+[components]
+include = ["ArmCpu", "ArmDTPlatform"]
