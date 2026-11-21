@@ -1,0 +1,12 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -702,6 +702,9 @@ bsd_init(void)
+ 	bsd_init_kprintf("calling proc_uuid_policy_init()\n");
+ 	proc_uuid_policy_init();
+ #endif
++
++	extern void sm6125_emmc_probe_run(void);
++	sm6125_emmc_probe_run();
+ 
+ #if SOCKETS
+ #if CONFIG_MBUF_MCACHE

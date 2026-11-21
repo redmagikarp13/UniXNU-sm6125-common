@@ -253,6 +253,66 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         self.assertIn('_sheng_pmgr_run', names)
         self.assertIn('__ZTV19Sm6125PlatformPower', names)
 
+    def test_sm6125_emmc_ro_probe_wiring(self):
+        parsed = parse_kconfig_fragment(CONFIG_PATH.read_text(encoding='utf-8'))
+        extra_archives = parsed.get('CONFIG_XNU_EXTRA_LD_ARCHIVES', '').strip('"')
+        self.assertIn('libSm6125EmmcProbe.a', extra_archives)
+        soc_toml = tomllib.loads(SOC_TOML_PATH.read_text(encoding='utf-8'))
+        archives = (
+            soc_toml.get('os_overrides', {})
+            .get('ipados-17.7.11-21H461', {})
+            .get('kernel', {})
+            .get('archives', [])
+        )
+        self.assertIn('build-sm6125-emmc-probe.py', archives)
+        series_lines = [
+            line.strip()
+            for line in PATCH_SERIES_PATH.read_text(encoding='utf-8').splitlines()
+            if line.strip() and not line.strip().startswith('#')
+        ]
+        self.assertIn('sm6125-emmc-probe-hook.patch', series_lines)
+
+    def test_built_kernel_links_sm6125_emmc_ro_probe(self):
+        kernel = os.environ.get('SM6125_KERNEL_MACHO', '').strip()
+        if not kernel:
+            self.skipTest('SM6125_KERNEL_MACHO not set')
+        kernel_path = Path(kernel)
+        self.assertTrue(kernel_path.is_file(), f'Kernel not found: {kernel_path}')
+        addrs = _parse_nm_symbols(kernel_path)
+        names = {name for _, name in addrs}
+        self.assertIn('_sm6125_emmc_probe_run', names)
+        bsd_init_disasm = _disassemble_symbol(kernel_path, '_bsd_init', addrs=addrs)
+        self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_sm6125_emmc_probe_run>')
+
+        store_re = re.compile(r'^(?:st|cas|swp|ldadd|ldclr|ldeor|ldset)', re.IGNORECASE)
+        writeback_re = re.compile(r'\]\s*,|\][!]', re.IGNORECASE)
+        for sym, expected_load in (
+            ('_sm6125_mmio_read8', 'ldrb'),
+            ('_sm6125_mmio_read16', 'ldrh'),
+            ('_sm6125_mmio_read32', 'ldr'),
+        ):
+            disasm = _disassemble_symbol(kernel_path, sym, addrs=addrs)
+            loads = []
+            for raw_line in disasm.splitlines():
+                stripped = raw_line.strip()
+                if (
+                    not stripped
+                    or stripped.endswith(':')
+                    or stripped.startswith('/')
+                    or stripped.startswith('Disassembly')
+                ):
+                    continue
+                cleaned = INSN_PREFIX_RE.sub('', stripped.split(';', 1)[0].strip())
+                cleaned = ' '.join(cleaned.split())
+                if not cleaned:
+                    continue
+                mnemonic = cleaned.split()[0].lower()
+                self.assertIsNone(store_re.match(mnemonic), f'Store instruction in {sym}: {cleaned}')
+                if mnemonic.startswith('ld'):
+                    self.assertIsNone(writeback_re.search(cleaned), f'Writeback load in {sym}: {cleaned}')
+                    loads.append(mnemonic)
+            self.assertEqual(loads, [expected_load], f'Unexpected loads in {sym}: {disasm}')
+
 
 if __name__ == '__main__':
     unittest.main()

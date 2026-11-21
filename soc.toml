@@ -18,4 +18,5 @@ archives = [
   "build-mockfs-fixture.py",
   "build-libpthread-kernel.py",
   "build-sm6125-platform-power.py",
+  "build-sm6125-emmc-probe.py",
 ]

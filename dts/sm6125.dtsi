@@ -101,5 +101,26 @@
 			interrupts = <1 1 0xf08>, <1 2 0xf08>, <1 3 0xf08>, <1 0 0xf08>;
 			clock-frequency = <19200000>;
 		};
+
+		/*
+		 * SM6125 GCC (0x01400000..0x015f0000) e controlador eMMC SDCC1 (sdhci@4744000).
+		 * Mantem /arm-io em base >= 0x01000000 (exigido pelo devicetree.py).
+		 */
+		clock_gcc: clock-controller@1400000 {
+			unixnu,adt-name = "gcc";
+			compatible = "qcom,gcc-sm6125", "qcom,gcc-trinket";
+			reg = <0x0 0x01400000 0x0 0x001f0000>;
+			#clock-cells = <1>;
+		};
+
+		sdhc_1: sdhci@4744000 {
+			unixnu,adt-name = "sdhci1";
+			compatible = "qcom,sdhci-msm-v5";
+			reg = <0x0 0x04744000 0x0 0x1000>, <0x0 0x04745000 0x0 0x1000>;
+			reg-names = "hc_mem", "cmdq_mem";
+			interrupt-parent = <&intc>;
+			interrupts = <0 0x15c 0>, <0 0x160 0>;
+			interrupt-names = "hc_irq", "pwr_irq";
+		};
 	};
 };
