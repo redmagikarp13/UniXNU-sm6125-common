@@ -7,6 +7,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IORegistryEntry.h>
+#include <kern/clock.h>
 #include <kern/task.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/libkern.h>
@@ -63,16 +64,9 @@ static void sm6125_emmc_delay_us(uint32_t microseconds)
 
 static uint64_t sm6125_emmc_now_us(void)
 {
-  uint64_t cnt = 0;
-  uint64_t frq = 0;
-  __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(cnt));
-  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
-  if (frq == 0u) {
-    return 0u;
-  }
-  const uint64_t sec = cnt / frq;
-  const uint64_t rem = cnt % frq;
-  return sec * 1000000ULL + (rem * 1000000ULL) / frq;
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+  return ns / 1000ULL;
 }
 
 }  // extern "C"

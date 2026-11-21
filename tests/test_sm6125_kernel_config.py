@@ -270,6 +270,7 @@ class Sm6125KernelConfigTests(unittest.TestCase):
             for line in PATCH_SERIES_PATH.read_text(encoding='utf-8').splitlines()
             if line.strip() and not line.strip().startswith('#')
         ]
+        self.assertIn('sm6125-modload-lock-order.patch', series_lines)
         self.assertIn('sm6125-emmc-probe-hook.patch', series_lines)
 
     def test_built_kernel_links_sm6125_emmc_ro_probe(self):
@@ -283,8 +284,14 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         self.assertIn('_sm6125_emmc_probe_run', names)
         self.assertIn('_sm6125_emmc_ident_gpt_run', names)
         self.assertIn('_sm6125_emmc_fast_bench_run', names)
+        self.assertIn('_sm6125_emmc_ctrl_init', names)
+        self.assertIn('_sm6125_emmc_ctrl_read_sectors', names)
+        self.assertIn('_sm6125_shngroot_parse', names)
+        self.assertIn('_sm6125_emmc_block_late_init', names)
+        self.assertIn('__ZTV15Sm6125EmmcBlock', names)
         bsd_init_disasm = _disassemble_symbol(kernel_path, '_bsd_init', addrs=addrs)
         self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_sm6125_emmc_probe_run>')
+        self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_sm6125_emmc_block_late_init>')
 
         load_re = re.compile(r'^(?:ld|cas|swp)', re.IGNORECASE)
         store_re = re.compile(r'^(?:st|cas|swp|ldadd|ldclr|ldeor|ldset)', re.IGNORECASE)

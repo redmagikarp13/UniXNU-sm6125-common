@@ -249,6 +249,42 @@ size_t sm6125_emmc_fast_format_report(
     char *buf,
     size_t cap);
 
+typedef struct {
+  const sm6125_emmc_hw_ops_t *ops;
+  uintptr_t gcc_sdcc1_va;
+  uintptr_t sdhci_va;
+  sm6125_emmc_dma_buf_t dma;
+  bool has_dma;
+  bool online;
+  uint32_t active_mode;
+  uint32_t step;
+  int32_t last_rc;
+  uint32_t sec_count;
+  uint8_t device_type;
+  uint8_t hs_timing;
+  uint32_t ext_csd_ro_crc;
+  uint32_t gpt_parts_crc;
+  uint64_t userdata_first;
+  uint64_t userdata_last;
+  uint32_t acfg;
+  uint8_t hc;
+  uint16_t hc2;
+  uint32_t ddr_cfg;
+} sm6125_emmc_ctrl_t;
+
+int32_t sm6125_emmc_ctrl_init(
+    sm6125_emmc_ctrl_t *ctrl,
+    const sm6125_emmc_hw_ops_t *ops,
+    uintptr_t gcc_sdcc1_va,
+    uintptr_t sdhci_va,
+    const sm6125_emmc_dma_buf_t *dma_buf);
+
+int32_t sm6125_emmc_ctrl_read_sectors(
+    sm6125_emmc_ctrl_t *ctrl,
+    uint64_t lba,
+    uint32_t sector_count,
+    uint8_t *dst_va);
+
 #ifdef __cplusplus
 }
 #endif

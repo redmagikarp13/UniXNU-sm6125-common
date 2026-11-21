@@ -6,8 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <CommonCrypto/CommonDigest.h>
+
 #include "Sm6125EmmcCore.h"
 #include "Sm6125EmmcReadOnly.h"
+#include "Sm6125ShngRoot.h"
 
 #define TEST_SECTORS 122142720ULL
 #define BAK_GPT_LBA (TEST_SECTORS - 1ULL)
@@ -102,6 +105,7 @@ typedef struct {
   bool inject_auto_cmd_err;
   bool inject_adma_canary_overrun;
   bool inject_ddr_bitflip;
+  bool inject_ddr_gpt_corrupt;
   bool inject_skip_ddr52_cap;
   bool card_selected;
 
@@ -281,6 +285,9 @@ static void sim_cache_invalidate_data(void *ctx, size_t offset, size_t len) {
 static void load_sector_for_lba(uint32_t lba, uint8_t out[512]) {
   if ((size_t)(lba + 1u) * 512u <= g_hw.gpt_primary_len) {
     memcpy(out, g_hw.gpt_primary + (size_t)lba * 512u, 512u);
+    if (g_hw.inject_ddr_gpt_corrupt && (g_hw.host_control2 & 0x7u) == 4u && lba == 2u) {
+      out[0] ^= 0xFFu;
+    }
   } else if (lba == (uint32_t)BAK_GPT_LBA) {
     memcpy(out, g_hw.gpt_backup, 512u);
   } else if (lba >= 0x01298000u && lba <= 0x0747BFDEu) {
@@ -454,6 +461,34 @@ static void dispatch_command(uint16_t cmd_reg) {
       assert((g_hw.transfer_mode & 0x0010u) != 0u);
       assert(g_hw.block_size == 512u && g_hw.block_count == 1u);
       g_hw.resp[0] = 0x00000900u;
+      if ((g_hw.transfer_mode & 0x0001u) != 0u) {
+        /* Single-block 32-bit ADMA2 */
+        assert(g_hw.transfer_mode == 0x0011u);
+        assert((g_hw.host_control & 0x3Cu) == 0x34u);
+        assert((g_hw.int_enable & 0x03000000u) == 0x03000000u);
+        assert(g_hw.adma_address_hi == 0u);
+        assert(g_hw.adma_address == (uint32_t)SIM_DESC_PA);
+        assert(!g_hw.desc_cpu_dirty);
+        assert(!g_hw.data_cpu_dirty);
+        const uint16_t attr = dma_rd_le16(g_hw.sim_desc_dram + 0u);
+        const uint16_t len = dma_rd_le16(g_hw.sim_desc_dram + 2u);
+        const uint32_t addr = le32(g_hw.sim_desc_dram + 4u);
+        assert(attr == 0x0023u);
+        assert(len == 512u);
+        assert(addr == (uint32_t)SIM_DATA_PA);
+        if (g_hw.inject_adma_err) {
+          g_hw.adma_error = 0x05u;
+          g_hw.int_status |= 0x02008001u;
+          break;
+        }
+        load_sector_for_lba(g_hw.argument, g_hw.sim_data_dram);
+        if (g_hw.inject_adma_canary_overrun) {
+          g_hw.sim_data_dram[SIM_XFER_BUF_BYTES] = 0x00u;
+        }
+        g_hw.data_cache_stale = true;
+        g_hw.int_status |= 0x00000003u; /* CC + TC */
+        break;
+      }
       if (g_hw.inject_cmd17_brr_timeout) {
         g_hw.int_status |= 0x00000001u; /* CC only, no BRR */
         break;
@@ -1126,6 +1161,199 @@ static int test_fast_bench_suite(void) {
   return 28;
 }
 
+static void host_sha256(const uint8_t *data, size_t len, uint8_t out_digest[32]) {
+  CC_SHA256(data, (CC_LONG)len, out_digest);
+}
+
+static void put_le64(uint8_t *p, uint64_t v) {
+  put_le32(p, (uint32_t)(v & 0xFFFFFFFFULL));
+  put_le32(p + 4u, (uint32_t)(v >> 32u));
+}
+
+static void build_test_shngroot(
+    uint8_t hdr[4096],
+    uint32_t version,
+    uint32_t count,
+    uint64_t image_bytes) {
+  memset(hdr, 0, 4096u);
+  memcpy(hdr, "SHNGROOT", 8u);
+  put_le32(hdr + 8u, version);
+  put_le32(hdr + 12u, count);
+  put_le64(hdr + 16u, image_bytes);
+}
+
+static void set_shngroot_entry(
+    uint8_t hdr[4096],
+    uint32_t idx,
+    const char *name,
+    uint64_t offset,
+    uint64_t size,
+    uint32_t block_size,
+    uint32_t flags,
+    uint8_t fill_sha) {
+  uint8_t *row = hdr + 24u + (size_t)idx * 128u;
+  memset(row, 0, 128u);
+  size_t nlen = strlen(name);
+  if (nlen > 31u) nlen = 31u;
+  memcpy(row, name, nlen);
+  put_le64(row + 32u, offset);
+  put_le64(row + 40u, size);
+  put_le32(row + 48u, block_size);
+  put_le32(row + 52u, flags);
+  memset(row + 56u, fill_sha, 32u);
+}
+
+static void seal_test_shngroot(uint8_t hdr[4096]) {
+  host_sha256(hdr, 4064u, hdr + 4064u);
+}
+
+static int test_ctrl_and_shngroot_suite(void) {
+  /* 1. Mode selector for sm6125-emmc-block */
+  assert(sm6125_emmc_block_select_mode(false, 0u) == SM6125_EMMC_BLOCK_MODE_OFF);
+  assert(sm6125_emmc_block_select_mode(true, 0u) == SM6125_EMMC_BLOCK_MODE_OFF);
+  assert(sm6125_emmc_block_select_mode(true, 1u) == SM6125_EMMC_BLOCK_MODE_DIAG);
+  assert(sm6125_emmc_block_select_mode(true, 2u) == SM6125_EMMC_BLOCK_MODE_PUBLISH);
+  assert(sm6125_emmc_block_select_mode(true, 3u) == SM6125_EMMC_BLOCK_MODE_INVALID);
+
+  /* 2. sm6125_emmc_ctrl_init happy path (DDR52 + ADMA2) + single & multi-chunk read_sectors */
+  init_hw_from_real_gpt();
+  g_hw.block_sdhci_if_clocks_off = true;
+  sm6125_emmc_dma_buf_t dma = make_sim_dma_buf();
+  sm6125_emmc_ctrl_t ctrl;
+  assert(sm6125_emmc_ctrl_init(
+             &ctrl, &g_hw_ops, (uintptr_t)&g_hw, (uintptr_t)&g_hw + 0x1000u, &dma) ==
+         SM6125_EMMC_RC_OK);
+  assert(ctrl.online);
+  assert(ctrl.active_mode == SM6125_EMMC_FAST_MODE_DDR52_ADMA);
+  assert(ctrl.sec_count == (uint32_t)TEST_SECTORS);
+  assert(ctrl.userdata_first == 0x01298000ULL && ctrl.userdata_last == 0x0747BFDEULL);
+  assert(ctrl.hc == 0x34u && ctrl.hc2 == 0x000Cu && ctrl.acfg == 0x00000205u);
+
+  /* Single-sector read via CMD17 ADMA2 (LBA 0 and LBA 1) */
+  uint8_t sec_buf[512];
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, 0ULL, 1u, sec_buf) == SM6125_EMMC_RC_OK);
+  assert(host_crc32(sec_buf, 512u) == 0xA22AB8BAu);
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, 1ULL, 1u, sec_buf) == SM6125_EMMC_RC_OK);
+  assert(host_crc32(sec_buf, 512u) == 0x3573B839u);
+
+  /* Multi-chunk read: 130 sectors (64 + 64 + 2 sectors = 66560 bytes) from userdata_first */
+  uint8_t *multi_buf = (uint8_t *)malloc(130u * 512u);
+  assert(multi_buf != NULL);
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, ctrl.userdata_first, 130u, multi_buf) ==
+         SM6125_EMMC_RC_OK);
+  uint8_t expect_sec[512];
+  for (uint32_t s = 0u; s < 130u; s++) {
+    fill_synth_sector((uint32_t)(ctrl.userdata_first + s), expect_sec);
+    assert(memcmp(multi_buf + (size_t)s * 512u, expect_sec, 512u) == 0);
+  }
+
+  /* Out-of-bounds and bad argument rejections */
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, 0ULL, 0u, sec_buf) == SM6125_EMMC_RC_BAD_ARG);
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, ctrl.sec_count, 1u, sec_buf) == SM6125_EMMC_RC_BAD_ARG);
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, ctrl.sec_count - 1ULL, 2u, multi_buf) ==
+         SM6125_EMMC_RC_BAD_ARG);
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, 0ULL, 1u, NULL) == SM6125_EMMC_RC_BAD_ARG);
+
+  /* Canary corruption detected during read_sectors */
+  g_hw.inject_adma_canary_overrun = true;
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, 0ULL, 1u, sec_buf) == SM6125_EMMC_RC_CANARY_CORRUPT);
+
+  /* 3. Fallback DDR52 -> HS50_ADMA on DDR52 GPT corruption or CMD6 failure */
+  init_hw_from_real_gpt();
+  g_hw.inject_ddr_gpt_corrupt = true;
+  assert(sm6125_emmc_ctrl_init(
+             &ctrl, &g_hw_ops, (uintptr_t)&g_hw, (uintptr_t)&g_hw + 0x1000u, &dma) ==
+         SM6125_EMMC_RC_OK);
+  assert(ctrl.online && ctrl.active_mode == SM6125_EMMC_FAST_MODE_HS50_ADMA);
+  assert(ctrl.hc == 0x34u && ctrl.hc2 == 0x0008u && ctrl.acfg == 0x0000020Bu);
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, 0ULL, 1u, sec_buf) == SM6125_EMMC_RC_OK);
+  assert(host_crc32(sec_buf, 512u) == 0xA22AB8BAu);
+
+  /* 4. Fallback HS50_ADMA -> HS50_PIO when DMA is NULL or ADMA errors */
+  init_hw_from_real_gpt();
+  g_hw.inject_adma_err = true;
+  assert(sm6125_emmc_ctrl_init(
+             &ctrl, &g_hw_ops, (uintptr_t)&g_hw, (uintptr_t)&g_hw + 0x1000u, &dma) ==
+         SM6125_EMMC_RC_OK);
+  assert(ctrl.online && ctrl.active_mode == SM6125_EMMC_FAST_MODE_HS50_PIO);
+  assert(ctrl.hc == 0x24u);
+  assert(sm6125_emmc_ctrl_read_sectors(&ctrl, ctrl.userdata_first, 130u, multi_buf) ==
+         SM6125_EMMC_RC_OK);
+  for (uint32_t s = 0u; s < 130u; s++) {
+    fill_synth_sector((uint32_t)(ctrl.userdata_first + s), expect_sec);
+    assert(memcmp(multi_buf + (size_t)s * 512u, expect_sec, 512u) == 0);
+  }
+  free(multi_buf);
+
+  /* 5. SHNGROOT parser v1 & v2 positive and negative cases */
+  uint8_t hdr[4096];
+  sm6125_shngroot_manifest_t man;
+  const uint64_t part_cap = (0x0747BFDEULL - 0x01298000ULL + 1ULL) * 512ULL;
+
+  /* Valid v2 with 2 RO windows + 2 data objects */
+  build_test_shngroot(hdr, 2u, 4u, 0x240000000ULL);
+  set_shngroot_entry(hdr, 0u, "OS", 0x100000ULL, 0x16A400000ULL, 512u, 1u, 0x11u);
+  set_shngroot_entry(hdr, 1u, "SystemOS", 0x16A600000ULL, 0xC4E00000ULL, 512u, 1u, 0x22u);
+  set_shngroot_entry(hdr, 2u, "OS.vroot", 0x230000000ULL, 0x2D48220ULL, 4096u, 3u, 0x33u);
+  set_shngroot_entry(hdr, 3u, "SystemOS.vroot", 0x233000000ULL, 0x189C220ULL, 4096u, 3u, 0x44u);
+  seal_test_shngroot(hdr);
+  assert(sm6125_shngroot_parse(hdr, part_cap, host_sha256, &man) == SM6125_SHNGROOT_RC_OK);
+  assert(man.version == 2u && man.entry_count == 4u && man.window_count == 2u && man.object_count == 2u);
+  assert(strcmp(man.entries[0].name, "OS") == 0 && man.entries[0].offset == 0x100000ULL);
+  assert(strcmp(man.entries[1].name, "SystemOS") == 0 && man.entries[1].flags == 1u);
+  assert(strcmp(man.entries[2].name, "OS.vroot") == 0 && man.entries[2].flags == 3u);
+
+  /* Corrupt magic */
+  hdr[0] = 'X';
+  assert(sm6125_shngroot_parse(hdr, part_cap, host_sha256, &man) == SM6125_SHNGROOT_RC_BAD_MAGIC);
+  hdr[0] = 'S';
+
+  /* Corrupt hash */
+  hdr[4095] ^= 0x01u;
+  assert(sm6125_shngroot_parse(hdr, part_cap, host_sha256, &man) == SM6125_SHNGROOT_RC_BAD_HASH);
+  hdr[4095] ^= 0x01u;
+
+  /* Data object in version 1 -> rejected */
+  put_le32(hdr + 8u, 1u);
+  seal_test_shngroot(hdr);
+  assert(sm6125_shngroot_parse(hdr, part_cap, host_sha256, &man) == SM6125_SHNGROOT_RC_BAD_ENTRY);
+
+  /* Overlapping windows -> rejected */
+  build_test_shngroot(hdr, 1u, 2u, 0x240000000ULL);
+  set_shngroot_entry(hdr, 0u, "OS", 0x100000ULL, 0x200000ULL, 512u, 1u, 0x11u);
+  set_shngroot_entry(hdr, 1u, "SystemOS", 0x200000ULL, 0x200000ULL, 512u, 1u, 0x22u);
+  seal_test_shngroot(hdr);
+  assert(sm6125_shngroot_parse(hdr, part_cap, host_sha256, &man) == SM6125_SHNGROOT_RC_OVERLAP);
+
+  /* Duplicate name -> rejected */
+  build_test_shngroot(hdr, 1u, 2u, 0x240000000ULL);
+  set_shngroot_entry(hdr, 0u, "OS", 0x100000ULL, 0x100000ULL, 512u, 1u, 0x11u);
+  set_shngroot_entry(hdr, 1u, "OS", 0x300000ULL, 0x100000ULL, 512u, 1u, 0x22u);
+  seal_test_shngroot(hdr);
+  assert(sm6125_shngroot_parse(hdr, part_cap, host_sha256, &man) == SM6125_SHNGROOT_RC_DUPLICATE_NAME);
+
+  /* Image larger than partition -> rejected */
+  seal_test_shngroot(hdr);
+  assert(sm6125_shngroot_parse(hdr, 0x100000ULL, host_sha256, &man) ==
+         SM6125_SHNGROOT_RC_BAD_IMAGE_SIZE);
+
+  /* Validate real on-disk userdata-root.img header if available */
+  const char *real_ud =
+      "/Volumes/Leo2/unixnu-ginkgo/UniXNU/out/ginkgo/ipados-17.7.11-21H461/ginkgo/userdata/userdata-root.img";
+  FILE *uf = fopen(real_ud, "rb");
+  if (uf != NULL) {
+    assert(fread(hdr, 1u, 4096u, uf) == 4096u);
+    fclose(uf);
+    assert(sm6125_shngroot_parse(hdr, part_cap, host_sha256, &man) == SM6125_SHNGROOT_RC_OK);
+    assert(man.window_count == 2u);
+    assert(strcmp(man.entries[0].name, "OS") == 0 && man.entries[0].offset == 0x100000ULL &&
+           man.entries[0].size == 6077580800ULL);
+    assert(strcmp(man.entries[1].name, "SystemOS") == 0 && man.entries[1].offset == 0x16A600000ULL &&
+           man.entries[1].size == 3303014400ULL);
+  }
+  return 26;
+}
+
 int main(int argc, char **argv) {
   const char *gpt_path = (argc > 1) ? argv[1] : "/Volumes/Leo2/backup-ginkgo/gpt_primary.bin";
   FILE *f = fopen(gpt_path, "rb");
@@ -1138,6 +1366,7 @@ int main(int argc, char **argv) {
   checks += test_happy_path_real_gpt();
   checks += test_error_and_corruption_cases();
   checks += test_fast_bench_suite();
+  checks += test_ctrl_and_shngroot_suite();
   printf("emmc_core_host: %d checks passed\n", checks);
   return 0;
 }

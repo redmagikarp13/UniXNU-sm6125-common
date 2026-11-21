@@ -16,6 +16,7 @@ with tempfile.TemporaryDirectory() as tmp:
             '-fsanitize=address,undefined',
             f'-I{PROBE_DIR}',
             str(PROBE_DIR / 'Sm6125EmmcCore.c'),
+            str(PROBE_DIR / 'Sm6125ShngRoot.c'),
             str(PROBE_DIR / 'tests/emmc_core_host.c'),
             '-o', str(exe),
         ],

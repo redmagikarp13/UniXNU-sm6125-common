@@ -27,6 +27,7 @@ enum {
   SDHCI_CMD_DATA = 0x20u,
 
   SDHCI_TM_READ = 0x0010u,
+  SDHCI_TM_SINGLE_ADMA = 0x0011u,
   SDHCI_TM_MULTI_PIO = 0x0036u,
   SDHCI_TM_MULTI_ADMA = 0x0037u,
 
@@ -975,11 +976,27 @@ static int32_t read_multi_pio_stream(
     uintptr_t sdhci_va,
     uint64_t lba,
     uint16_t block_count,
+    uint8_t *dst_out,
     uint32_t *running_crc,
     uint32_t *remaining_crc_bytes,
     cmd_fail_t *fail) {
   if (lba > 0xFFFFFFFFULL || block_count == 0u || block_count > XFER_MAX_SECTORS) {
     return SM6125_EMMC_RC_BAD_ARG;
+  }
+  if (block_count == 1u) {
+    uint8_t sec1[512];
+    uint8_t *target = dst_out ? dst_out : sec1;
+    const int32_t rc1 = read_sector_cmd17(ops, sdhci_va, lba, target, fail);
+    if (rc1 != SM6125_EMMC_RC_OK) {
+      sdhci_reset_cmd_dat(ops, sdhci_va);
+      return rc1;
+    }
+    if (running_crc && remaining_crc_bytes && *remaining_crc_bytes > 0u) {
+      const uint32_t take = *remaining_crc_bytes < 512u ? *remaining_crc_bytes : 512u;
+      *running_crc = crc32_update(*running_crc, target, take);
+      *remaining_crc_bytes -= take;
+    }
+    return SM6125_EMMC_RC_OK;
   }
   const uint16_t cmd_reg =
       (uint16_t)((18u << 8u) | SDHCI_CMD_DATA | SDHCI_CMD_INDEX | SDHCI_CMD_CRC | SDHCI_CMD_RESP_SHORT);
@@ -1042,13 +1059,14 @@ static int32_t read_multi_pio_stream(
     if ((is & SDHCI_INT_DATA_AVAIL) != 0u) {
       ops->write32(sdhci_va, SM6125_SDHCI_INT_STATUS, SDHCI_INT_DATA_AVAIL);
     }
+    uint8_t *blk_dst = dst_out ? (dst_out + (size_t)b * 512u) : sec;
     for (size_t w = 0u; w < 128u; w++) {
       const uint32_t word = ops->read32(sdhci_va, SM6125_SDHCI_BUFFER);
-      wr_le32(sec + w * 4u, word);
+      wr_le32(blk_dst + w * 4u, word);
     }
     if (running_crc && remaining_crc_bytes && *remaining_crc_bytes > 0u) {
       const uint32_t take = *remaining_crc_bytes < 512u ? *remaining_crc_bytes : 512u;
-      *running_crc = crc32_update(*running_crc, sec, take);
+      *running_crc = crc32_update(*running_crc, blk_dst, take);
       *remaining_crc_bytes -= take;
     }
   }
@@ -1116,6 +1134,7 @@ static int32_t read_multi_adma(
     uint64_t lba,
     uint16_t block_count,
     bool poison_data,
+    uint8_t *dst_out,
     uint32_t *running_crc,
     uint32_t *remaining_crc_bytes,
     cmd_fail_t *fail) {
@@ -1123,14 +1142,16 @@ static int32_t read_multi_adma(
     return SM6125_EMMC_RC_BAD_ARG;
   }
   const uint32_t total_bytes = (uint32_t)block_count * 512u;
+  const uint32_t cmd_idx = (block_count == 1u) ? 17u : 18u;
+  const uint16_t tm_reg = (block_count == 1u) ? SDHCI_TM_SINGLE_ADMA : SDHCI_TM_MULTI_ADMA;
   const uint16_t cmd_reg =
-      (uint16_t)((18u << 8u) | SDHCI_CMD_DATA | SDHCI_CMD_INDEX | SDHCI_CMD_CRC | SDHCI_CMD_RESP_SHORT);
+      (uint16_t)((cmd_idx << 8u) | SDHCI_CMD_DATA | SDHCI_CMD_INDEX | SDHCI_CMD_CRC | SDHCI_CMD_RESP_SHORT);
 
   const uint32_t stale = ops->read32(sdhci_va, SM6125_SDHCI_INT_STATUS);
   if (stale != 0u) {
     ops->write32(sdhci_va, SM6125_SDHCI_INT_STATUS, stale);
   }
-  int32_t rc = wait_inhibit_clear(ops, sdhci_va, 18u, (uint32_t)lba, cmd_reg, true, fail);
+  int32_t rc = wait_inhibit_clear(ops, sdhci_va, cmd_idx, (uint32_t)lba, cmd_reg, true, fail);
   if (rc != SM6125_EMMC_RC_OK) {
     return rc;
   }
@@ -1149,7 +1170,7 @@ static int32_t read_multi_adma(
   ops->write32(sdhci_va, SM6125_SDHCI_ADMA_ADDRESS_HI, 0u);
   ops->write16(sdhci_va, SM6125_SDHCI_BLOCK_SIZE, 512u);
   ops->write16(sdhci_va, SM6125_SDHCI_BLOCK_COUNT, block_count);
-  ops->write16(sdhci_va, SM6125_SDHCI_TRANSFER_MODE, SDHCI_TM_MULTI_ADMA);
+  ops->write16(sdhci_va, SM6125_SDHCI_TRANSFER_MODE, tm_reg);
   ops->write32(sdhci_va, SM6125_SDHCI_ARGUMENT, (uint32_t)lba);
   ops->write16(sdhci_va, SM6125_SDHCI_COMMAND, cmd_reg);
 
@@ -1164,7 +1185,7 @@ static int32_t read_multi_adma(
       const uint32_t ps = ops->read32(sdhci_va, SM6125_SDHCI_PRESENT_STATE);
       const uint16_t ac = ops->read16(sdhci_va, SM6125_SDHCI_AUTO_CMD_STATUS);
       const uint8_t ae = ops->read8(sdhci_va, SM6125_SDHCI_ADMA_ERROR);
-      latch_cmd_fail(fail, 18u, (uint32_t)lba, cmd_reg, is, ps, r0, ac, ae);
+      latch_cmd_fail(fail, cmd_idx, (uint32_t)lba, cmd_reg, is, ps, r0, ac, ae);
       ops->write32(sdhci_va, SM6125_SDHCI_INT_STATUS, is);
       sdhci_reset_cmd_dat(ops, sdhci_va);
       if ((is & SDHCI_INT_ADMA_ERR) != 0u) {
@@ -1183,7 +1204,7 @@ static int32_t read_multi_adma(
       cmd_done = true;
       if ((r0 & MMC_R1_ERR_MASK) != 0u) {
         const uint32_t ps = ops->read32(sdhci_va, SM6125_SDHCI_PRESENT_STATE);
-        latch_cmd_fail(fail, 18u, (uint32_t)lba, cmd_reg, is, ps, r0, 0u, 0u);
+        latch_cmd_fail(fail, cmd_idx, (uint32_t)lba, cmd_reg, is, ps, r0, 0u, 0u);
         ops->write32(sdhci_va, SM6125_SDHCI_INT_STATUS, is);
         sdhci_reset_cmd_dat(ops, sdhci_va);
         return SM6125_EMMC_RC_R1_ERROR;
@@ -1196,7 +1217,7 @@ static int32_t read_multi_adma(
     ops->delay_us(5u);
   }
   if (!xfer_done) {
-    latch_cmd_fail(fail, 18u, (uint32_t)lba, cmd_reg, is,
+    latch_cmd_fail(fail, cmd_idx, (uint32_t)lba, cmd_reg, is,
                    ops->read32(sdhci_va, SM6125_SDHCI_PRESENT_STATE), r0, 0u, 0u);
     sdhci_reset_cmd_dat(ops, sdhci_va);
     return cmd_done ? SM6125_EMMC_RC_DATA_TIMEOUT : SM6125_EMMC_RC_CMD_TIMEOUT;
@@ -1207,9 +1228,13 @@ static int32_t read_multi_adma(
 
   for (size_t i = 0u; i < dma->canary_size; i++) {
     if (dma->data_va[dma->canary_offset + i] != 0xA5u) {
-      latch_cmd_fail(fail, 18u, (uint32_t)lba, cmd_reg, is, 0u, r0, 0u, 0u);
+      latch_cmd_fail(fail, cmd_idx, (uint32_t)lba, cmd_reg, is, 0u, r0, 0u, 0u);
       return SM6125_EMMC_RC_CANARY_CORRUPT;
     }
+  }
+
+  if (dst_out) {
+    copy_buf(dst_out, dma->data_va, total_bytes);
   }
 
   if (running_crc && remaining_crc_bytes && *remaining_crc_bytes > 0u) {
@@ -1255,8 +1280,8 @@ static int32_t verify_gpt_and_bench(
     const uint32_t left = array_sectors - done;
     const uint16_t chunk = (uint16_t)(left < XFER_MAX_SECTORS ? left : XFER_MAX_SECTORS);
     const int32_t rc = dma
-        ? read_multi_adma(ops, sdhci_va, dma, part_lba + done, chunk, true, &gpt_crc, &rem_gpt, fail)
-        : read_multi_pio_stream(ops, sdhci_va, part_lba + done, chunk, &gpt_crc, &rem_gpt, fail);
+        ? read_multi_adma(ops, sdhci_va, dma, part_lba + done, chunk, true, NULL, &gpt_crc, &rem_gpt, fail)
+        : read_multi_pio_stream(ops, sdhci_va, part_lba + done, chunk, NULL, &gpt_crc, &rem_gpt, fail);
     if (rc != SM6125_EMMC_RC_OK) {
       return rc;
     }
@@ -1276,9 +1301,9 @@ static int32_t verify_gpt_and_bench(
     const uint64_t c0 = ops->now_us();
     const int32_t rc = dma
         ? read_multi_adma(ops, sdhci_va, dma, userdata_first + done, chunk,
-                          done == 0u, NULL, NULL, fail)
+                          done == 0u, NULL, NULL, NULL, fail)
         : read_multi_pio_stream(ops, sdhci_va, userdata_first + done, chunk,
-                                NULL, NULL, fail);
+                                NULL, NULL, NULL, fail);
     const uint64_t c1 = ops->now_us();
     if (rc != SM6125_EMMC_RC_OK) {
       return rc;
@@ -1740,4 +1765,261 @@ size_t sm6125_emmc_fast_format_report(
 
   c.buf[c.len] = '\0';
   return c.len;
+}
+
+static int32_t verify_mode_gpt_reads(
+    const sm6125_emmc_hw_ops_t *ops,
+    uintptr_t sdhci_va,
+    const sm6125_emmc_dma_buf_t *dma,
+    uint64_t part_lba,
+    uint32_t array_bytes,
+    uint32_t expected_hdr_crc,
+    uint32_t expected_parts_crc,
+    cmd_fail_t *fail) {
+  if (dma) {
+    fill_buf(dma->data_va + dma->canary_offset, 0xA5u, dma->canary_size);
+    /* Verify 1-sector CMD17 ADMA2 on LBA 1 (primary GPT header). */
+    uint8_t lba1[512];
+    uint32_t hdr_crc = 0u;
+    const int32_t rc1 = read_multi_adma(
+        ops, sdhci_va, dma, 1ULL, 1u, true, lba1, NULL, NULL, fail);
+    if (rc1 != SM6125_EMMC_RC_OK) {
+      return rc1;
+    }
+    if (!validate_gpt_header(lba1, 1ULL, &hdr_crc) || hdr_crc != expected_hdr_crc) {
+      return SM6125_EMMC_RC_BAD_GPT_HDR;
+    }
+  }
+  const uint32_t array_sectors = (array_bytes + 511u) / 512u;
+  uint32_t rem_gpt = array_bytes;
+  uint32_t gpt_crc = 0xFFFFFFFFu;
+  for (uint32_t done = 0u; done < array_sectors;) {
+    const uint32_t left = array_sectors - done;
+    const uint16_t chunk = (uint16_t)(left < XFER_MAX_SECTORS ? left : XFER_MAX_SECTORS);
+    const int32_t rc = dma
+        ? read_multi_adma(ops, sdhci_va, dma, part_lba + done, chunk, true, NULL, &gpt_crc, &rem_gpt, fail)
+        : read_multi_pio_stream(ops, sdhci_va, part_lba + done, chunk, NULL, &gpt_crc, &rem_gpt, fail);
+    if (rc != SM6125_EMMC_RC_OK) {
+      return rc;
+    }
+    done += chunk;
+  }
+  if (~gpt_crc != expected_parts_crc) {
+    return SM6125_EMMC_RC_BAD_GPT_PARTS;
+  }
+  return SM6125_EMMC_RC_OK;
+}
+
+static void capture_ctrl_regs(sm6125_emmc_ctrl_t *ctrl) {
+  ctrl->acfg = ctrl->ops->read32(ctrl->gcc_sdcc1_va, SM6125_GCC_SDCC1_APPS_CFG_RCGR_OFF);
+  ctrl->hc = ctrl->ops->read8(ctrl->sdhci_va, SM6125_SDHCI_HOST_CONTROL);
+  ctrl->hc2 = ctrl->ops->read16(ctrl->sdhci_va, SM6125_SDHCI_HOST_CONTROL2);
+  ctrl->ddr_cfg = ctrl->ops->read32(ctrl->sdhci_va, SM6125_SDHCI_V5_DDR_CONFIG);
+}
+
+int32_t sm6125_emmc_ctrl_init(
+    sm6125_emmc_ctrl_t *ctrl,
+    const sm6125_emmc_hw_ops_t *ops,
+    uintptr_t gcc_sdcc1_va,
+    uintptr_t sdhci_va,
+    const sm6125_emmc_dma_buf_t *dma_buf) {
+  if (!ctrl || !ops || !ops->read8 || !ops->read16 || !ops->read32 ||
+      !ops->write8 || !ops->write16 || !ops->write32 || !ops->delay_us ||
+      !gcc_sdcc1_va || !sdhci_va) {
+    return SM6125_EMMC_RC_BAD_ARG;
+  }
+  zero_buf(ctrl, sizeof(*ctrl));
+  ctrl->ops = ops;
+  ctrl->gcc_sdcc1_va = gcc_sdcc1_va;
+  ctrl->sdhci_va = sdhci_va;
+
+  sm6125_emmc_ident_report_t id;
+  emmc_gpt_meta_t meta;
+  int32_t rc = ident_and_gpt_core(ops, gcc_sdcc1_va, sdhci_va, &id, &meta);
+  ctrl->step = id.step;
+  ctrl->last_rc = rc;
+  ctrl->sec_count = id.sec_count;
+  ctrl->device_type = id.device_type;
+  ctrl->ext_csd_ro_crc = meta.ext_csd_ro_crc;
+  ctrl->gpt_parts_crc = id.gpt_parts_crc;
+  ctrl->userdata_first = id.userdata_first;
+  ctrl->userdata_last = id.userdata_last;
+  if (rc != SM6125_EMMC_RC_OK) {
+    return rc;
+  }
+  if (id.userdata_last < id.userdata_first) {
+    ctrl->last_rc = SM6125_EMMC_RC_NO_USERDATA;
+    return SM6125_EMMC_RC_NO_USERDATA;
+  }
+
+  ops->write32(sdhci_va, SM6125_SDHCI_INT_ENABLE, 0x03FF003Fu);
+
+  cmd_fail_t fail;
+  zero_buf(&fail, sizeof(fail));
+
+  if ((id.device_type & 0x02u) == 0u) {
+    ctrl->step = SM6125_EMMC_STEP_HS_CMD6;
+    ctrl->last_rc = SM6125_EMMC_RC_SWITCH_ERROR;
+    return SM6125_EMMC_RC_SWITCH_ERROR;
+  }
+
+  ctrl->step = SM6125_EMMC_STEP_HS_CMD6;
+  rc = mmc_switch_cmd6(ops, sdhci_va, 185u, 1u, &fail);
+  if (rc != SM6125_EMMC_RC_OK) {
+    ctrl->last_rc = rc;
+    return rc;
+  }
+
+  ops->write8(sdhci_va, SM6125_SDHCI_HOST_CONTROL, SDHCI_HC_HISPD);
+  ctrl->step = SM6125_EMMC_STEP_GCC_50M;
+  rc = switch_controller_bus_speed(ops, gcc_sdcc1_va, sdhci_va, 0x0000020Bu, false, &fail);
+  if (rc != SM6125_EMMC_RC_OK) {
+    ctrl->last_rc = rc;
+    return rc;
+  }
+
+  ctrl->step = SM6125_EMMC_STEP_HS_8BIT_CMD6;
+  rc = mmc_switch_cmd6(ops, sdhci_va, 183u, 2u, &fail);
+  if (rc != SM6125_EMMC_RC_OK) {
+    ctrl->last_rc = rc;
+    return rc;
+  }
+  ops->write8(sdhci_va, SM6125_SDHCI_HOST_CONTROL, SDHCI_HC_EXT_8BIT | SDHCI_HC_HISPD);
+
+  uint8_t ext_csd[512];
+  rc = send_cmd_pio(ops, sdhci_va, 8u, 0u,
+                    (uint8_t)(SDHCI_CMD_DATA | SDHCI_CMD_INDEX | SDHCI_CMD_CRC | SDHCI_CMD_RESP_SHORT),
+                    true, NULL, ext_csd, &fail);
+  if (rc != SM6125_EMMC_RC_OK) {
+    ctrl->last_rc = rc;
+    return rc;
+  }
+  ctrl->hs_timing = ext_csd[185];
+  if (ext_csd[185] != 1u || crc32_bytes(&ext_csd[192], 320u) != meta.ext_csd_ro_crc) {
+    ctrl->last_rc = SM6125_EMMC_RC_EXT_CSD_MISMATCH;
+    return SM6125_EMMC_RC_EXT_CSD_MISMATCH;
+  }
+
+  ctrl->step = SM6125_EMMC_STEP_HS_PIO_GPT;
+  rc = verify_mode_gpt_reads(
+      ops, sdhci_va, NULL, meta.part_lba, meta.array_bytes,
+      id.gpt_hdr_crc, id.gpt_parts_crc, &fail);
+  if (rc != SM6125_EMMC_RC_OK) {
+    ctrl->last_rc = rc;
+    return rc;
+  }
+
+  ctrl->online = true;
+  ctrl->active_mode = SM6125_EMMC_FAST_MODE_HS50_PIO;
+  ctrl->last_rc = SM6125_EMMC_RC_OK;
+
+  if (!dma_buf_valid(dma_buf)) {
+    ctrl->step = SM6125_EMMC_STEP_FAST_DONE;
+    capture_ctrl_regs(ctrl);
+    return SM6125_EMMC_RC_OK;
+  }
+
+  ctrl->dma = *dma_buf;
+  ctrl->has_dma = true;
+  fill_buf(ctrl->dma.data_va + ctrl->dma.canary_offset, 0xA5u, ctrl->dma.canary_size);
+
+  ops->write8(sdhci_va, SM6125_SDHCI_HOST_CONTROL,
+              SDHCI_HC_EXT_8BIT | SDHCI_HC_ADMA32 | SDHCI_HC_HISPD);
+  ctrl->step = SM6125_EMMC_STEP_HS_ADMA_GPT;
+  rc = verify_mode_gpt_reads(
+      ops, sdhci_va, &ctrl->dma, meta.part_lba, meta.array_bytes,
+      id.gpt_hdr_crc, id.gpt_parts_crc, &fail);
+  if (rc != SM6125_EMMC_RC_OK) {
+    sdhci_reset_cmd_dat(ops, sdhci_va);
+    ops->write8(sdhci_va, SM6125_SDHCI_HOST_CONTROL, SDHCI_HC_EXT_8BIT | SDHCI_HC_HISPD);
+    ctrl->has_dma = false;
+    ctrl->step = SM6125_EMMC_STEP_FAST_DONE;
+    capture_ctrl_regs(ctrl);
+    return SM6125_EMMC_RC_OK;
+  }
+
+  ctrl->active_mode = SM6125_EMMC_FAST_MODE_HS50_ADMA;
+
+  if ((id.device_type & 0x04u) == 0u) {
+    ctrl->step = SM6125_EMMC_STEP_FAST_DONE;
+    capture_ctrl_regs(ctrl);
+    return SM6125_EMMC_RC_OK;
+  }
+
+  ctrl->step = SM6125_EMMC_STEP_DDR_CMD6;
+  rc = mmc_switch_cmd6(ops, sdhci_va, 183u, 6u, &fail);
+  if (rc == SM6125_EMMC_RC_OK) {
+    ctrl->step = SM6125_EMMC_STEP_GCC_100M;
+    rc = switch_controller_bus_speed(ops, gcc_sdcc1_va, sdhci_va, 0x00000205u, true, &fail);
+  }
+  if (rc == SM6125_EMMC_RC_OK) {
+    ctrl->step = SM6125_EMMC_STEP_DDR_ADMA_GPT;
+    rc = verify_mode_gpt_reads(
+        ops, sdhci_va, &ctrl->dma, meta.part_lba, meta.array_bytes,
+        id.gpt_hdr_crc, id.gpt_parts_crc, &fail);
+  }
+  if (rc == SM6125_EMMC_RC_OK) {
+    ctrl->active_mode = SM6125_EMMC_FAST_MODE_DDR52_ADMA;
+    ctrl->step = SM6125_EMMC_STEP_FAST_DONE;
+    capture_ctrl_regs(ctrl);
+    return SM6125_EMMC_RC_OK;
+  }
+
+  /* Clean fallback from DDR52 attempt back to HS50 8-bit SDR */
+  sdhci_reset_cmd_dat(ops, sdhci_va);
+  (void)switch_controller_bus_speed(ops, gcc_sdcc1_va, sdhci_va, 0x0000020Bu, false, &fail);
+  (void)mmc_switch_cmd6(ops, sdhci_va, 183u, 2u, &fail);
+  ops->write8(sdhci_va, SM6125_SDHCI_HOST_CONTROL,
+              SDHCI_HC_EXT_8BIT | SDHCI_HC_ADMA32 | SDHCI_HC_HISPD);
+  if (verify_mode_gpt_reads(
+          ops, sdhci_va, &ctrl->dma, meta.part_lba, meta.array_bytes,
+          id.gpt_hdr_crc, id.gpt_parts_crc, &fail) == SM6125_EMMC_RC_OK) {
+    ctrl->active_mode = SM6125_EMMC_FAST_MODE_HS50_ADMA;
+  } else {
+    sdhci_reset_cmd_dat(ops, sdhci_va);
+    ops->write8(sdhci_va, SM6125_SDHCI_HOST_CONTROL, SDHCI_HC_EXT_8BIT | SDHCI_HC_HISPD);
+    ctrl->has_dma = false;
+    ctrl->active_mode = SM6125_EMMC_FAST_MODE_HS50_PIO;
+  }
+  ctrl->step = SM6125_EMMC_STEP_FAST_DONE;
+  capture_ctrl_regs(ctrl);
+  return SM6125_EMMC_RC_OK;
+}
+
+int32_t sm6125_emmc_ctrl_read_sectors(
+    sm6125_emmc_ctrl_t *ctrl,
+    uint64_t lba,
+    uint32_t sector_count,
+    uint8_t *dst_va) {
+  if (!ctrl || !ctrl->online || !ctrl->ops || !dst_va || sector_count == 0u ||
+      lba >= (uint64_t)ctrl->sec_count ||
+      (uint64_t)sector_count > (uint64_t)ctrl->sec_count - lba) {
+    return SM6125_EMMC_RC_BAD_ARG;
+  }
+
+  const bool use_adma =
+      ctrl->has_dma &&
+      (ctrl->active_mode == SM6125_EMMC_FAST_MODE_DDR52_ADMA ||
+       ctrl->active_mode == SM6125_EMMC_FAST_MODE_HS50_ADMA);
+
+  cmd_fail_t fail;
+  zero_buf(&fail, sizeof(fail));
+
+  for (uint32_t done = 0u; done < sector_count;) {
+    const uint32_t left = sector_count - done;
+    const uint16_t chunk = (uint16_t)(left < XFER_MAX_SECTORS ? left : XFER_MAX_SECTORS);
+    uint8_t *chunk_dst = dst_va + (size_t)done * 512u;
+    const int32_t rc = use_adma
+        ? read_multi_adma(ctrl->ops, ctrl->sdhci_va, &ctrl->dma,
+                          lba + done, chunk, false, chunk_dst, NULL, NULL, &fail)
+        : read_multi_pio_stream(ctrl->ops, ctrl->sdhci_va,
+                                lba + done, chunk, chunk_dst, NULL, NULL, &fail);
+    if (rc != SM6125_EMMC_RC_OK) {
+      ctrl->last_rc = rc;
+      return rc;
+    }
+    done += chunk;
+  }
+  ctrl->last_rc = SM6125_EMMC_RC_OK;
+  return SM6125_EMMC_RC_OK;
 }

@@ -1,6 +1,6 @@
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -702,6 +702,9 @@ bsd_init(void)
+@@ -818,6 +818,9 @@ bsd_init(void)
  	bsd_init_kprintf("calling proc_uuid_policy_init()\n");
  	proc_uuid_policy_init();
  #endif
@@ -10,3 +10,14 @@
  
  #if SOCKETS
  #if CONFIG_MBUF_MCACHE
+@@ -933,6 +936,9 @@ bsd_init(void)
+ #if (DEVELOPMENT || DEBUG) && defined(XNU_NATIVE_OFFLINE_GPU) && XNU_NATIVE_OFFLINE_GPU
+ 	extern void native_offline_gpu_publish(void);
+ 	native_offline_gpu_publish();
+ #endif
++
++	extern void sm6125_emmc_block_late_init(void);
++	sm6125_emmc_block_late_init();
+ 
+ 	/*
+ 	 * We attach the loopback interface *way* down here to ensure
