@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Sonda estritamente somente-leitura do bloco GCC SDCC1 e SDHCI-MSM v5 (SM6125).
+// Sonda GCC SDCC1 + SDHCI-MSM v5 (SM6125): modo 1 somente-leitura, modo 2 ident+GPT via PIO.
+#include "Sm6125EmmcCore.h"
 #include "Sm6125EmmcReadOnly.h"
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
@@ -35,12 +36,45 @@ __attribute__((noinline)) uint32_t sm6125_mmio_read32(uintptr_t base, uint32_t o
   return value;
 }
 
+__attribute__((noinline)) void sm6125_mmio_write8(uintptr_t base, uint32_t offset, uint8_t value)
+{
+  const uintptr_t addr = base + offset;
+  __asm__ volatile("strb %w0, [%1]" : : "r"(static_cast<uint32_t>(value)), "r"(addr) : "memory");
+}
+
+__attribute__((noinline)) void sm6125_mmio_write16(uintptr_t base, uint32_t offset, uint16_t value)
+{
+  const uintptr_t addr = base + offset;
+  __asm__ volatile("strh %w0, [%1]" : : "r"(static_cast<uint32_t>(value)), "r"(addr) : "memory");
+}
+
+__attribute__((noinline)) void sm6125_mmio_write32(uintptr_t base, uint32_t offset, uint32_t value)
+{
+  const uintptr_t addr = base + offset;
+  __asm__ volatile("str %w0, [%1]" : : "r"(value), "r"(addr) : "memory");
+}
+
+static void sm6125_emmc_delay_us(uint32_t microseconds)
+{
+  IODelay(microseconds);
+}
+
 }  // extern "C"
 
 static const sm6125_mmio_ro_ops_t kReadOnlyMmioOps = {
     .read8 = sm6125_mmio_read8,
     .read16 = sm6125_mmio_read16,
     .read32 = sm6125_mmio_read32,
+};
+
+static const sm6125_emmc_hw_ops_t kIdentMmioOps = {
+    .read8 = sm6125_mmio_read8,
+    .read16 = sm6125_mmio_read16,
+    .read32 = sm6125_mmio_read32,
+    .write8 = sm6125_mmio_write8,
+    .write16 = sm6125_mmio_write16,
+    .write32 = sm6125_mmio_write32,
+    .delay_us = sm6125_emmc_delay_us,
 };
 
 __attribute__((noreturn)) static void panic_with_snapshot(const sm6125_emmc_ro_snapshot_t *snap)
@@ -142,7 +176,7 @@ extern "C" void sm6125_emmc_probe_run(void)
   sm6125_emmc_ro_snapshot_t snap;
   memset(&snap, 0, sizeof(snap));
 
-  if (mode != SM6125_EMMC_PROBE_MODE_RO_SNAPSHOT) {
+  if (mode == SM6125_EMMC_PROBE_MODE_INVALID) {
     snap.err = SM6125_EMMC_RO_ERR_INVALID_MODE;
     panic_with_snapshot(&snap);
   }
@@ -151,6 +185,41 @@ extern "C" void sm6125_emmc_probe_run(void)
       snap.gcc_pa > (UINT64_MAX - SM6125_GCC_SDCC1_PAGE_OFFSET - SM6125_GCC_SDCC1_WINDOW_SIZE)) {
     snap.err = SM6125_EMMC_RO_ERR_ADT_INVALID;
     panic_with_snapshot(&snap);
+  }
+
+  if (mode == SM6125_EMMC_PROBE_MODE_IDENT_GPT) {
+    sm6125_emmc_ident_report_t rep;
+    memset(&rep, 0, sizeof(rep));
+    IOMemoryDescriptor *gcc_desc = nullptr;
+    IOMemoryMap *gcc_map = nullptr;
+    IOMemoryDescriptor *sdhci_desc = nullptr;
+    IOMemoryMap *sdhci_map = nullptr;
+    if (!map_mmio_window(
+            snap.gcc_pa + SM6125_GCC_SDCC1_PAGE_OFFSET,
+            SM6125_GCC_SDCC1_WINDOW_SIZE,
+            &gcc_desc,
+            &gcc_map)) {
+      snap.err = SM6125_EMMC_RO_ERR_MAP_GCC;
+      panic_with_snapshot(&snap);
+    }
+    if (!map_mmio_window(snap.sdhci_pa, SM6125_SDHCI_MIN_REGION_SIZE, &sdhci_desc, &sdhci_map)) {
+      OSSafeReleaseNULL(gcc_map);
+      OSSafeReleaseNULL(gcc_desc);
+      snap.err = SM6125_EMMC_RO_ERR_MAP_SDHCI;
+      panic_with_snapshot(&snap);
+    }
+    sm6125_emmc_ident_gpt_run(
+        &kIdentMmioOps,
+        static_cast<uintptr_t>(gcc_map->getVirtualAddress()),
+        static_cast<uintptr_t>(sdhci_map->getVirtualAddress()),
+        &rep);
+    OSSafeReleaseNULL(sdhci_map);
+    OSSafeReleaseNULL(sdhci_desc);
+    OSSafeReleaseNULL(gcc_map);
+    OSSafeReleaseNULL(gcc_desc);
+    char buf[768];
+    sm6125_emmc_ident_format_report(&rep, buf, sizeof(buf));
+    panic("%s", buf);
   }
 
   IOMemoryDescriptor *gcc_desc = nullptr;

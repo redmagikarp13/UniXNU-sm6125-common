@@ -281,9 +281,11 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         addrs = _parse_nm_symbols(kernel_path)
         names = {name for _, name in addrs}
         self.assertIn('_sm6125_emmc_probe_run', names)
+        self.assertIn('_sm6125_emmc_ident_gpt_run', names)
         bsd_init_disasm = _disassemble_symbol(kernel_path, '_bsd_init', addrs=addrs)
         self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_sm6125_emmc_probe_run>')
 
+        load_re = re.compile(r'^(?:ld|cas|swp)', re.IGNORECASE)
         store_re = re.compile(r'^(?:st|cas|swp|ldadd|ldclr|ldeor|ldset)', re.IGNORECASE)
         writeback_re = re.compile(r'\]\s*,|\][!]', re.IGNORECASE)
         for sym, expected_load in (
@@ -312,6 +314,33 @@ class Sm6125KernelConfigTests(unittest.TestCase):
                     self.assertIsNone(writeback_re.search(cleaned), f'Writeback load in {sym}: {cleaned}')
                     loads.append(mnemonic)
             self.assertEqual(loads, [expected_load], f'Unexpected loads in {sym}: {disasm}')
+
+        for sym, expected_store in (
+            ('_sm6125_mmio_write8', 'strb'),
+            ('_sm6125_mmio_write16', 'strh'),
+            ('_sm6125_mmio_write32', 'str'),
+        ):
+            disasm = _disassemble_symbol(kernel_path, sym, addrs=addrs)
+            stores = []
+            for raw_line in disasm.splitlines():
+                stripped = raw_line.strip()
+                if (
+                    not stripped
+                    or stripped.endswith(':')
+                    or stripped.startswith('/')
+                    or stripped.startswith('Disassembly')
+                ):
+                    continue
+                cleaned = INSN_PREFIX_RE.sub('', stripped.split(';', 1)[0].strip())
+                cleaned = ' '.join(cleaned.split())
+                if not cleaned:
+                    continue
+                mnemonic = cleaned.split()[0].lower()
+                self.assertIsNone(load_re.match(mnemonic), f'Load instruction in {sym}: {cleaned}')
+                if mnemonic.startswith('st'):
+                    self.assertIsNone(writeback_re.search(cleaned), f'Writeback store in {sym}: {cleaned}')
+                    stores.append(mnemonic)
+            self.assertEqual(stores, [expected_store], f'Unexpected stores in {sym}: {disasm}')
 
 
 if __name__ == '__main__':

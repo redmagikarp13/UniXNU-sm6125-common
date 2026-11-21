@@ -23,6 +23,12 @@ READ_ACCESSOR_LOADS = {
     '_sm6125_mmio_read16': 'ldrh',
     '_sm6125_mmio_read32': 'ldr',
 }
+WRITE_ACCESSOR_STORES = {
+    '_sm6125_mmio_write8': 'strb',
+    '_sm6125_mmio_write16': 'strh',
+    '_sm6125_mmio_write32': 'str',
+}
+LOAD_MNEMONIC_RE = re.compile(r'^(?:ld|cas|swp)', re.IGNORECASE)
 STORE_MNEMONIC_RE = re.compile(r'^(?:st|cas|swp|ldadd|ldclr|ldeor|ldset)', re.IGNORECASE)
 WRITEBACK_RE = re.compile(r'\]\s*,|\][!]', re.IGNORECASE)
 INSN_PREFIX_RE = re.compile(r'^[0-9a-f]+:\s+[0-9a-f]+\s+', re.IGNORECASE)
@@ -63,9 +69,22 @@ def replay_compile(record_path: Path, source: Path, obj: Path, extra_flags: list
     subprocess.check_call(command, cwd=record['directory'], timeout=120)
 
 
-def audit_object_sections_and_disasm(core_obj: Path, probe_obj: Path) -> None:
+def extract_symbol_insns(disasm: str) -> list[str]:
+    insns: list[str] = []
+    for raw_line in disasm.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.endswith(':') or stripped.startswith('/') or stripped.startswith('Disassembly'):
+            continue
+        cleaned = INSN_PREFIX_RE.sub('', stripped.split(';', 1)[0].strip())
+        cleaned = ' '.join(cleaned.split())
+        if cleaned:
+            insns.append(cleaned)
+    return insns
+
+
+def audit_object_sections_and_disasm(ro_obj: Path, core_obj: Path, probe_obj: Path) -> None:
     text_end = 0
-    for obj in (core_obj, probe_obj):
+    for obj in (ro_obj, core_obj, probe_obj):
         raw = obj.read_bytes()
         check_object(raw, obj.stem)
         info = macho(raw)
@@ -88,10 +107,8 @@ def audit_object_sections_and_disasm(core_obj: Path, probe_obj: Path) -> None:
             if kind in ('t', 'T') and addr < text_end:
                 text_syms.append((addr, name))
 
-    for sym in READ_ACCESSOR_LOADS:
-        require(sym in defined_syms, f'Missing read accessor {sym} in {probe_obj.name}')
-    mmio_writes = [s for s in defined_syms if 'mmio_write' in s.lower()]
-    require(not mmio_writes, f'Unexpected MMIO write symbols in {probe_obj.name}: {mmio_writes}')
+    for sym in (*READ_ACCESSOR_LOADS, *WRITE_ACCESSOR_STORES):
+        require(sym in defined_syms, f'Missing MMIO accessor {sym} in {probe_obj.name}')
 
     llvm_objdump = find_llvm_tool('llvm-objdump')
     for sym, expected_load in READ_ACCESSOR_LOADS.items():
@@ -103,15 +120,7 @@ def audit_object_sections_and_disasm(core_obj: Path, probe_obj: Path) -> None:
             text=True,
             timeout=60,
         )
-        insns: list[str] = []
-        for raw_line in disasm.splitlines():
-            stripped = raw_line.strip()
-            if not stripped or stripped.endswith(':') or stripped.startswith('/') or stripped.startswith('Disassembly'):
-                continue
-            cleaned = INSN_PREFIX_RE.sub('', stripped.split(';', 1)[0].strip())
-            cleaned = ' '.join(cleaned.split())
-            if cleaned:
-                insns.append(cleaned)
+        insns = extract_symbol_insns(disasm)
         require(bool(insns), f'No instructions decoded for {sym}')
         require(insns[-1].lower() == 'ret', f'{sym} must end with ret: {insns}')
         loads = []
@@ -123,13 +132,36 @@ def audit_object_sections_and_disasm(core_obj: Path, probe_obj: Path) -> None:
                 loads.append(mnemonic)
         require(loads == [expected_load], f'{sym} expected single [{expected_load}], got {loads}: {insns}')
 
+    for sym, expected_store in WRITE_ACCESSOR_STORES.items():
+        start = next((addr for addr, name in text_syms if name == sym), None)
+        require(start is not None, f'Text symbol missing for {sym}')
+        stop = next((addr for addr, _ in text_syms if addr > start), text_end)
+        disasm = subprocess.check_output(
+            [llvm_objdump, '-d', f'--start-address={start:#x}', f'--stop-address={stop:#x}', str(probe_obj)],
+            text=True,
+            timeout=60,
+        )
+        insns = extract_symbol_insns(disasm)
+        require(bool(insns), f'No instructions decoded for {sym}')
+        require(insns[-1].lower() == 'ret', f'{sym} must end with ret: {insns}')
+        stores = []
+        for insn in insns:
+            mnemonic = insn.split()[0].lower()
+            require(not LOAD_MNEMONIC_RE.match(mnemonic), f'Load instruction forbidden in {sym}: {insn}')
+            if mnemonic.startswith('st'):
+                require(not WRITEBACK_RE.search(insn), f'Writeback store forbidden in {sym}: {insn}')
+                stores.append(mnemonic)
+        require(stores == [expected_store], f'{sym} expected single [{expected_store}], got {stores}: {insns}')
+
 
 def main() -> None:
     script_dir = Path(__file__).resolve().parent
     probe_dir = script_dir / 'emmc-probe'
-    c_src = probe_dir / 'Sm6125EmmcReadOnly.c'
+    ro_src = probe_dir / 'Sm6125EmmcReadOnly.c'
+    core_src = probe_dir / 'Sm6125EmmcCore.c'
     cpp_src = probe_dir / 'Sm6125EmmcProbe.cpp'
-    c_obj = OUT / 'Sm6125EmmcReadOnly.o'
+    ro_obj = OUT / 'Sm6125EmmcReadOnly.o'
+    core_obj = OUT / 'Sm6125EmmcCore.o'
     cpp_obj = OUT / 'Sm6125EmmcProbe.o'
 
     obj_root = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837'
@@ -141,14 +173,15 @@ def main() -> None:
         '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
         '-Wno-unnecessary-virtual-specifier',
     ]
-    replay_compile(c_record, c_src, c_obj, [*common_warnings, '-I', str(probe_dir)])
+    replay_compile(c_record, ro_src, ro_obj, [*common_warnings, '-I', str(probe_dir)])
+    replay_compile(c_record, core_src, core_obj, [*common_warnings, '-I', str(probe_dir)])
     replay_compile(cpp_record, cpp_src, cpp_obj, [*common_warnings, '-I', str(probe_dir)])
 
-    audit_object_sections_and_disasm(c_obj, cpp_obj)
+    audit_object_sections_and_disasm(ro_obj, core_obj, cpp_obj)
 
     archive = OUT / 'libSm6125EmmcProbe.a'
     archive.unlink(missing_ok=True)
-    subprocess.check_call(['xcrun', 'ar', 'rcs', str(archive), str(c_obj), str(cpp_obj)], timeout=60)
+    subprocess.check_call(['xcrun', 'ar', 'rcs', str(archive), str(ro_obj), str(core_obj), str(cpp_obj)], timeout=60)
 
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     stamp = obj_root / '.sm6125-emmc-probe.sha256'
@@ -158,10 +191,11 @@ def main() -> None:
         stamp.write_text(digest + '\n', encoding='utf-8')
 
     report = {
-        'c_source_sha256': hashlib.sha256(c_src.read_bytes()).hexdigest(),
+        'ro_source_sha256': hashlib.sha256(ro_src.read_bytes()).hexdigest(),
+        'core_source_sha256': hashlib.sha256(core_src.read_bytes()).hexdigest(),
         'cpp_source_sha256': hashlib.sha256(cpp_src.read_bytes()).hexdigest(),
         'archive_sha256': digest,
-        'mode': 'strictly read-only GCC SDCC1 + SDHCI-MSM v5 snapshot probe for SM6125',
+        'mode': 'SM6125 GCC SDCC1 + SDHCI-MSM v5 probe (mode=1 read-only snapshot, mode=2 ident+GPT PIO)',
     }
     (OUT / 'build-report.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     print(f'PASS: Sm6125EmmcProbe ({archive} sha256 {digest})')

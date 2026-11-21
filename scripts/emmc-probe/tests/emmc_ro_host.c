@@ -207,9 +207,10 @@ static int test_boot_arg_policy(void) {
   assert(sm6125_emmc_probe_select_mode(false, 1u) == SM6125_EMMC_PROBE_MODE_OFF);
   assert(sm6125_emmc_probe_select_mode(true, 0u) == SM6125_EMMC_PROBE_MODE_OFF);
   assert(sm6125_emmc_probe_select_mode(true, 1u) == SM6125_EMMC_PROBE_MODE_RO_SNAPSHOT);
-  assert(sm6125_emmc_probe_select_mode(true, 2u) == SM6125_EMMC_PROBE_MODE_INVALID);
+  assert(sm6125_emmc_probe_select_mode(true, 2u) == 2u);
+  assert(sm6125_emmc_probe_select_mode(true, 3u) == SM6125_EMMC_PROBE_MODE_INVALID);
   assert(sm6125_emmc_probe_select_mode(true, 0xFFFFFFFFu) == SM6125_EMMC_PROBE_MODE_INVALID);
-  return 5;
+  return 6;
 }
 
 static int test_adt_translation_validation(void) {

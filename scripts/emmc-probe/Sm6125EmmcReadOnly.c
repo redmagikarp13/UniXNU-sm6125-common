@@ -68,7 +68,7 @@ uint32_t sm6125_emmc_probe_select_mode(bool has_arg, uint32_t arg_value) {
   if (!has_arg) {
     return SM6125_EMMC_PROBE_MODE_OFF;
   }
-  if (arg_value <= SM6125_EMMC_PROBE_MODE_RO_SNAPSHOT) {
+  if (arg_value <= SM6125_EMMC_PROBE_MODE_IDENT_GPT) {
     return arg_value;
   }
   return SM6125_EMMC_PROBE_MODE_INVALID;
