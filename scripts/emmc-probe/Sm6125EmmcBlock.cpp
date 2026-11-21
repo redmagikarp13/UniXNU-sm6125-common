@@ -101,6 +101,8 @@ extern volatile uint64_t native_data_persist_first_lba;
 extern volatile uint64_t native_data_persist_present;
 extern volatile uint64_t native_data_flushes;
 extern volatile uint64_t native_data_flush_blocks;
+extern volatile uint64_t native_data_io_reads;
+extern volatile uint64_t native_data_io_writes;
 
 extern volatile int native_owner_data_status;
 extern volatile int native_owner_data_stage;
@@ -1723,21 +1725,20 @@ extern "C" void sm6125_emmc_block_late_init(void) {
       data_media_ready = has_matching_media_uuid(kDataVolumeUuid);
     }
     if (has_shngroot) {
-      if (obs.saw_driver && obs.os_auth && obs.sysos_auth) {
-        if (obs.saw_driver && obs.os_auth && obs.sysos_auth &&
-            data_media_ready) {
-          break;
-        }
-      } else {
-        if (obs.saw_driver && obs.part_count >= 30u &&
-            obs.target_bsd[0] != '\0') {
-          break;
-        }
+      if (obs.saw_driver && obs.os_auth && obs.sysos_auth &&
+          data_media_ready) {
+        break;
       }
-      IOSleep(50);
+    } else {
+      if (obs.saw_driver && obs.part_count >= 30u &&
+          obs.target_bsd[0] != '\0') {
+        break;
+      }
     }
-    strlcpy(ctrl->os_bsd, obs.os_bsd, sizeof(ctrl->os_bsd));
-    strlcpy(ctrl->sysos_bsd, obs.sysos_bsd, sizeof(ctrl->sysos_bsd));
+    IOSleep(50);
+  }
+  strlcpy(ctrl->os_bsd, obs.os_bsd, sizeof(ctrl->os_bsd));
+  strlcpy(ctrl->sysos_bsd, obs.sysos_bsd, sizeof(ctrl->sysos_bsd));
 
     if (mode == SM6125_EMMC_BLOCK_MODE_PUBLISH) {
       return;
@@ -1790,123 +1791,138 @@ extern "C" void sm6125_emmc_block_late_init(void) {
   extern "C" void sm6125_emmc_post_mount_check(int cache_error, int launchd_ok,
                                                int dyld_ok, int dsc_ok) {
     Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
+    if (!ctrl) {
+      return;
+    }
+    ctrl->root_check_valid = true;
+    ctrl->root_cache_err = cache_error;
+    ctrl->root_launchd_ok = launchd_ok;
+    ctrl->root_dyld_ok = dyld_ok;
+    ctrl->root_dsc_ok = dsc_ok;
+
+    if (ctrl->block_mode != SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG) {
+      return;
+    }
+
+    const bool root_ok =
+        cache_error == 0 && native_owner_root_accepted == 1 &&
+        native_owner_cache_stage == 6 && native_owner_cache_status == 0 &&
+        native_owner_cache_native_union == 1 &&
+        native_owner_boot_manifest_status == 0 && launchd_ok == 1 &&
+        dyld_ok == 1 && dsc_ok == 1;
+
+    if (ctrl->ram_started && root_ok) {
+      /* Defer final diagnostic report until native_owner_data_prepare()
+       * mounts /private/var. */
+      return;
+    }
+
+    const uint32_t reqs =
+        __atomic_load_n(&ctrl->io_requests, __ATOMIC_RELAXED);
+    const uint32_t errs = __atomic_load_n(&ctrl->io_errors, __ATOMIC_RELAXED);
+    const uint32_t vr_blks =
+        __atomic_load_n(&ctrl->vr_verified_blocks, __ATOMIC_RELAXED);
+    const uint32_t vr_errs =
+        __atomic_load_n(&ctrl->vr_integrity_errors, __ATOMIC_RELAXED);
+    const uint64_t secs =
+        __atomic_load_n(&ctrl->io_sectors, __ATOMIC_RELAXED);
+    const uint64_t us = __atomic_load_n(&ctrl->io_time_us, __ATOMIC_RELAXED);
+    const uint32_t kib = static_cast<uint32_t>((secs * 512ULL) / 1024ULL);
+    const uint32_t kibs =
+        (us > 0ULL) ? static_cast<uint32_t>(
+                          ((secs * 512ULL / 1024ULL) * 1000000ULL) / us)
+                    : 0u;
+
+    const uint32_t man_tag =
+        (static_cast<uint32_t>(native_owner_boot_manifest_hash[0]) << 24u) |
+        (static_cast<uint32_t>(native_owner_boot_manifest_hash[1]) << 16u) |
+        (static_cast<uint32_t>(native_owner_boot_manifest_hash[2]) << 8u) |
+        static_cast<uint32_t>(native_owner_boot_manifest_hash[3]);
+
+    const bool all_ok =
+        root_ok && errs == 0u && vr_errs == 0u && vr_blks > 0u;
+
+    panic("SM6125-ROOT-MNT ok=%u os=/dev/%s sys=%s union=%d\n"
+          "AUTH root=%d(ap=%d) sys_rc=%d stg=%d man=%d(%08x)\n"
+          "VFS launchd=%d dyld=%d dsc=%d\n"
+          "VR blk=%u err=%u IO req=%u kib=%u kibs=%u io_err=%u",
+          all_ok ? 1u : 0u, ctrl->os_bsd[0] ? ctrl->os_bsd : "none",
+          native_owner_cache_device_path[0] ? native_owner_cache_device_path
+                                            : "none",
+          native_owner_cache_native_union, native_owner_root_accepted,
+          native_owner_root_apple_autherr, cache_error,
+          native_owner_cache_stage, native_owner_boot_manifest_status,
+          man_tag, launchd_ok, dyld_ok, dsc_ok, vr_blks, vr_errs, reqs, kib,
+          kibs, errs);
+  }
+
+  extern "C" void sm6125_emmc_post_data_mount_check(
+      int data_error, int vfs_err, uint32_t prev_boot, uint32_t cur_boot,
+      int readback_ok) {
+    Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
     if (!ctrl || ctrl->block_mode != SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG) {
-      if (!ctrl) {
-        return;
-      }
-      ctrl->root_check_valid = true;
-      ctrl->root_cache_err = cache_error;
-      ctrl->root_launchd_ok = launchd_ok;
-      ctrl->root_dyld_ok = dyld_ok;
-      ctrl->root_dsc_ok = dsc_ok;
-
-      if (ctrl->block_mode != SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG) {
-        return;
-      }
-
-      const bool root_ok =
-          cache_error == 0 && native_owner_root_accepted == 1 &&
-          native_owner_cache_stage == 6 && native_owner_cache_status == 0 &&
-          native_owner_cache_native_union == 1 &&
-          native_owner_boot_manifest_status == 0 && launchd_ok == 1 &&
-          dyld_ok == 1 && dsc_ok == 1;
-
-      if (ctrl->ram_started && root_ok) {
-        /* Defer final diagnostic report until native_owner_data_prepare()
-         * mounts /private/var. */
-        return;
-      }
-
-      const uint32_t reqs =
-          __atomic_load_n(&ctrl->io_requests, __ATOMIC_RELAXED);
-      const uint32_t errs = __atomic_load_n(&ctrl->io_errors, __ATOMIC_RELAXED);
-      const uint32_t vr_blks =
-          __atomic_load_n(&ctrl->vr_verified_blocks, __ATOMIC_RELAXED);
-      const uint32_t vr_errs =
-          __atomic_load_n(&ctrl->vr_integrity_errors, __ATOMIC_RELAXED);
-      const uint64_t secs =
-          __atomic_load_n(&ctrl->io_sectors, __ATOMIC_RELAXED);
-      const uint64_t us = __atomic_load_n(&ctrl->io_time_us, __ATOMIC_RELAXED);
-      const uint32_t kib = static_cast<uint32_t>((secs * 512ULL) / 1024ULL);
-      const uint32_t kibs =
-          (us > 0ULL) ? static_cast<uint32_t>(
-                            ((secs * 512ULL / 1024ULL) * 1000000ULL) / us)
-                      : 0u;
-
-      const uint32_t man_tag =
-          (static_cast<uint32_t>(native_owner_boot_manifest_hash[0]) << 24u) |
-          (static_cast<uint32_t>(native_owner_boot_manifest_hash[1]) << 16u) |
-          (static_cast<uint32_t>(native_owner_boot_manifest_hash[2]) << 8u) |
-          static_cast<uint32_t>(native_owner_boot_manifest_hash[3]);
-
-      const bool all_ok = cache_error == 0 && native_owner_root_accepted == 1 &&
-                          native_owner_cache_stage == 6 &&
-                          native_owner_cache_status == 0 &&
-                          native_owner_cache_native_union == 1 &&
-                          native_owner_boot_manifest_status == 0 &&
-                          launchd_ok == 1 && dyld_ok == 1 && dsc_ok == 1 &&
-                          errs == 0u && vr_errs == 0u && vr_blks > 0u;
-      const bool all_ok =
-          root_ok && errs == 0u && vr_errs == 0u && vr_blks > 0u;
-
-      panic("SM6125-ROOT-MNT ok=%u os=/dev/%s sys=%s union=%d\n"
-            "AUTH root=%d(ap=%d) sys_rc=%d stg=%d man=%d(%08x)\n"
-            "VFS launchd=%d dyld=%d dsc=%d\n"
-            "VR blk=%u err=%u IO req=%u kib=%u kibs=%u io_err=%u",
-            all_ok ? 1u : 0u, ctrl->os_bsd[0] ? ctrl->os_bsd : "none",
-            native_owner_cache_device_path[0] ? native_owner_cache_device_path
-                                              : "none",
-            native_owner_cache_native_union, native_owner_root_accepted,
-            native_owner_root_apple_autherr, cache_error,
-            native_owner_cache_stage, native_owner_boot_manifest_status,
-            man_tag, launchd_ok, dyld_ok, dsc_ok, vr_blks, vr_errs, reqs, kib,
-            kibs, errs);
+      return;
     }
 
-    extern "C" void sm6125_emmc_post_data_mount_check(
-        int data_error, int vfs_err, uint32_t prev_boot, uint32_t cur_boot,
-        int readback_ok) {
-      Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
-      if (!ctrl || ctrl->block_mode != SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG) {
-        return;
-      }
+    const unsigned gpt_post = native_ufs_store_gpt_check();
+    const uint32_t errs = __atomic_load_n(&ctrl->io_errors, __ATOMIC_RELAXED);
+    const uint32_t vr_errs =
+        __atomic_load_n(&ctrl->vr_integrity_errors, __ATOMIC_RELAXED);
+    const bool persist_req = ctrl->persist_enabled;
+    const bool persist_ok =
+        !persist_req || (ctrl->persist_window_open &&
+                         (native_data_persist_state == 2u ||
+                          native_data_persist_state == 3u) &&
+                         native_data_persist_gpt == 1u &&
+                         native_data_persist_gpt_after == 1u &&
+                         native_data_persist_errors == 0ULL &&
+                         ctrl->core.write_req_count > 0ULL &&
+                         ctrl->core.flush_count > 0ULL && gpt_post == 1u);
 
-      const unsigned gpt_post = native_ufs_store_gpt_check();
-      const uint32_t errs = __atomic_load_n(&ctrl->io_errors, __ATOMIC_RELAXED);
-      const uint32_t vr_errs =
-          __atomic_load_n(&ctrl->vr_integrity_errors, __ATOMIC_RELAXED);
-      const bool persist_req = ctrl->persist_enabled;
-      const bool persist_ok =
-          !persist_req || (ctrl->persist_window_open &&
-                           (native_data_persist_state == 2u ||
-                            native_data_persist_state == 3u) &&
-                           native_data_persist_gpt == 1u &&
-                           native_data_persist_gpt_after == 1u &&
-                           native_data_persist_errors == 0ULL &&
-                           ctrl->core.write_req_count > 0ULL &&
-                           ctrl->core.flush_count > 0ULL && gpt_post == 1u);
+    const bool all_ok =
+        ctrl->root_check_valid && ctrl->root_cache_err == 0 &&
+        ctrl->root_launchd_ok == 1 && ctrl->root_dyld_ok == 1 &&
+        ctrl->root_dsc_ok == 1 && data_error == 0 &&
+        native_owner_data_status == 0 && native_owner_data_readonly == 0 &&
+        native_ram_block_ready == 1u && vfs_err == 0 && readback_ok == 1 &&
+        errs == 0u && vr_errs == 0u && gpt_post == 1u && persist_ok;
 
-      const bool all_ok =
-          ctrl->root_check_valid && ctrl->root_cache_err == 0 &&
-          ctrl->root_launchd_ok == 1 && ctrl->root_dyld_ok == 1 &&
-          ctrl->root_dsc_ok == 1 && data_error == 0 &&
-          native_owner_data_status == 0 && native_owner_data_readonly == 0 &&
-          native_ram_block_ready == 1u && vfs_err == 0 && readback_ok == 1 &&
-          errs == 0u && vr_errs == 0u && gpt_post == 1u && persist_ok;
+    panic("SM6125-DATA-MNT ok=%u dev=%s rc=%d stg=%d ro=%d\n"
+          "PERSIST en=%u st=%u hdr=%u wb=%u lba=0x%llx cache=%u\n"
+          "EMMC_WR req=%llu sec=%llu flush=%llu gpt=%u/%u/%u p_err=%llu\n"
+          "VAR_CHK err=%d prev=%u cur=%u rdok=%d io_err=%u vr_err=%u",
+          all_ok ? 1u : 0u,
+          native_owner_data_device_path[0] ? native_owner_data_device_path
+                                           : "none",
+          data_error, native_owner_data_stage, native_owner_data_readonly,
+          persist_req ? 1u : 0u, native_data_persist_state,
+          native_data_persist_header, native_data_write_back,
+          native_data_persist_first_lba, ctrl->core.has_cache_ctrl ? 1u : 0u,
+          ctrl->core.write_req_count, ctrl->core.write_sectors_total,
+          ctrl->core.flush_count, native_data_persist_gpt,
+          native_data_persist_gpt_after, gpt_post, native_data_persist_errors,
+          vfs_err, prev_boot, cur_boot, readback_ok, errs, vr_errs);
+  }
 
-      panic("SM6125-DATA-MNT ok=%u dev=%s rc=%d stg=%d ro=%d\n"
-            "PERSIST en=%u st=%u hdr=%u wb=%u lba=0x%llx cache=%u\n"
-            "EMMC_WR req=%llu sec=%llu flush=%llu gpt=%u/%u/%u p_err=%llu\n"
-            "VAR_CHK err=%d prev=%u cur=%u rdok=%d io_err=%u vr_err=%u",
-            all_ok ? 1u : 0u,
-            native_owner_data_device_path[0] ? native_owner_data_device_path
-                                             : "none",
-            data_error, native_owner_data_stage, native_owner_data_readonly,
-            persist_req ? 1u : 0u, native_data_persist_state,
-            native_data_persist_header, native_data_write_back,
-            native_data_persist_first_lba, ctrl->core.has_cache_ctrl ? 1u : 0u,
-            ctrl->core.write_req_count, ctrl->core.write_sectors_total,
-            ctrl->core.flush_count, native_data_persist_gpt,
-            native_data_persist_gpt_after, gpt_post, native_data_persist_errors,
-            vfs_err, prev_boot, cur_boot, readback_ok, errs, vr_errs);
-    }
+  extern "C" void sm6125_emmc_dump_userspace_probe(
+      uint32_t delay_s, uint32_t proc_count, const char *ps_summary) {
+    Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
+    const uint64_t emmc_rd =
+        ctrl ? __atomic_load_n(&ctrl->io_requests, __ATOMIC_RELAXED) : 0ULL;
+    const uint64_t emmc_wr = ctrl ? ctrl->core.write_req_count : 0ULL;
+    const uint64_t emmc_sec = ctrl ? ctrl->core.write_sectors_total : 0ULL;
+    const uint64_t emmc_fl = ctrl ? ctrl->core.flush_count : 0ULL;
+    const uint64_t data_rd =
+        __atomic_load_n(&native_data_io_reads, __ATOMIC_RELAXED);
+    const uint64_t data_wr =
+        __atomic_load_n(&native_data_io_writes, __ATOMIC_RELAXED);
+    const unsigned gpt_ok = ctrl ? native_ufs_store_gpt_check() : 0u;
+    panic("SM6125-USERSPACE-PROBE t=%us procs=%u\n"
+          "EMMC rd=%llu wr=%llu sec=%llu fl=%llu gpt=%u\n"
+          "DATA rd=%llu wr=%llu st=%u p_err=%llu\n"
+          "PS %s",
+          delay_s, proc_count, emmc_rd, emmc_wr, emmc_sec, emmc_fl, gpt_ok,
+          data_rd, data_wr, native_data_persist_state,
+          native_data_persist_errors,
+          (ps_summary && ps_summary[0]) ? ps_summary : "none");
+  }
