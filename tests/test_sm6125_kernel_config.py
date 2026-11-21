@@ -5,10 +5,14 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tomllib
 import unittest
 
 SOC_DIR = Path(__file__).resolve().parents[1]
+WORKSPACE = SOC_DIR.parent
 CONFIG_PATH = SOC_DIR / 'configs/sm6125.config'
+SOC_TOML_PATH = SOC_DIR / 'soc.toml'
+BOARD_TOML_PATH = WORKSPACE / 'UniXNU-ginkgo/board.toml'
 PATCH_SERIES_PATH = SOC_DIR / 'patches/xnu/series'
 PHANDLE_ALIAS_PATCH = SOC_DIR / 'patches/xnu/iokit-fdt-phandle-alias.patch'
 
@@ -213,6 +217,21 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         disasm = _disassemble_symbol(kernel_path, '_PE_create_console')
         self.assertEqual(check_pe_create_console_disasm(disasm, require_dt_probe=True), [])
 
+    def test_sm6125_pmgr_config_and_wiring(self):
+        parsed = parse_kconfig_fragment(CONFIG_PATH.read_text(encoding='utf-8'))
+        self.assertEqual(parsed.get('CONFIG_XNU_SHENG_PMGR'), 'y')
+        soc_toml = tomllib.loads(SOC_TOML_PATH.read_text(encoding='utf-8'))
+        archives = (
+            soc_toml.get('os_overrides', {})
+            .get('ipados-17.7.11-21H461', {})
+            .get('kernel', {})
+            .get('archives', [])
+        )
+        self.assertIn('build-sm6125-platform-power.py', archives)
+        board_toml = tomllib.loads(BOARD_TOML_PATH.read_text(encoding='utf-8'))
+        kernel_args = board_toml.get('payload', {}).get('kernel_args', [])
+        self.assertIn('pmgr=2', kernel_args)
+
     def test_built_kernel_make_reference_table_aliases_phandle(self):
         kernel = os.environ.get('SM6125_KERNEL_MACHO', '').strip()
         if not kernel:
@@ -223,6 +242,16 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         phandle_key_va = _lookup_symbol(addrs, '_gIODTPHandleKey', kernel_path)
         disasm = _disassemble_symbol(kernel_path, '__ZL18MakeReferenceTablePK13OpaqueDTEntryb', addrs=addrs)
         self.assertIn(phandle_key_va, find_adrp_load_targets(disasm))
+
+    def test_built_kernel_links_sm6125_platform_power(self):
+        kernel = os.environ.get('SM6125_KERNEL_MACHO', '').strip()
+        if not kernel:
+            self.skipTest('SM6125_KERNEL_MACHO not set')
+        kernel_path = Path(kernel)
+        self.assertTrue(kernel_path.is_file(), f'Kernel not found: {kernel_path}')
+        names = {name for _, name in _parse_nm_symbols(kernel_path)}
+        self.assertIn('_sheng_pmgr_run', names)
+        self.assertIn('__ZTV19Sm6125PlatformPower', names)
 
 
 if __name__ == '__main__':

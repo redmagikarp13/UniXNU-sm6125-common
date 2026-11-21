@@ -6,3 +6,16 @@ description = "Qualcomm SM6125 (Trinket / Nicobar, Snapdragon 665, Kryo 260 ARMv
 
 [components]
 include = ["ArmCpu", "ArmDTPlatform"]
+
+[os_overrides."ipados-17.7.11-21H461".kernel]
+archives = [
+  "build-corecrypto-14.py",
+  "build-corecrypto-14.py --namespace",
+  "component:ArmDTPlatform",
+  "component:ArmCpu",
+  "component:SoftwareAES",
+  "build-software-aes-bindings.py",
+  "build-mockfs-fixture.py",
+  "build-libpthread-kernel.py",
+  "build-sm6125-platform-power.py",
+]
