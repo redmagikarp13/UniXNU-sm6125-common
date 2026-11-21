@@ -1,0 +1,20 @@
+--- a/iokit/Kernel/IODeviceTreeSupport.cpp
++++ b/iokit/Kernel/IODeviceTreeSupport.cpp
+@@ -498,7 +498,17 @@
+ 				regEntry->setLocation( location );
+ 			}
+ 		}
++		if (!propTable->getObject( gIODTPHandleKey )) {
++			OSData *fdtPHandle = OSDynamicCast( OSData, propTable->getObject( "phandle" ));
++			if (!fdtPHandle) {
++				fdtPHandle = OSDynamicCast( OSData, propTable->getObject( "linux,phandle" ));
++			}
++			if (fdtPHandle && (fdtPHandle->getLength() == sizeof(UInt32))
++			    && (*((const UInt32 *) fdtPHandle->getBytesNoCopy()) != 0)) {
++				propTable->setObject( gIODTPHandleKey, fdtPHandle );
++			}
++		}
+ 	}
+ 
+ 	return regEntry;
+ }

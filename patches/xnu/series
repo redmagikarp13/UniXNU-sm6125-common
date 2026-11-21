@@ -4,3 +4,4 @@
 arch:../../../patches/xnu/native-smp-secondary.patch
 arch:../../../patches/xnu/sheng-platform-power.patch
 platform-sleep-hook.patch
+iokit-fdt-phandle-alias.patch

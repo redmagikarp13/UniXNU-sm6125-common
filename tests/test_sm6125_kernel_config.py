@@ -9,9 +9,72 @@ import unittest
 
 SOC_DIR = Path(__file__).resolve().parents[1]
 CONFIG_PATH = SOC_DIR / 'configs/sm6125.config'
+PATCH_SERIES_PATH = SOC_DIR / 'patches/xnu/series'
+PHANDLE_ALIAS_PATCH = SOC_DIR / 'patches/xnu/iokit-fdt-phandle-alias.patch'
 
 MOV_LOW_RE = re.compile(r'\bmovz?\s+[wx](\d+),\s*#0xc000\b', re.IGNORECASE)
 MOVK_HIGH_RE = re.compile(r'\bmovk\s+[wx](\d+),\s*#0x3c0f,\s*lsl\s+#16\b', re.IGNORECASE)
+INSN_PREFIX_RE = re.compile(r'^[0-9a-f]+:\s+[0-9a-f]+\s+', re.IGNORECASE)
+
+
+def find_adrp_load_targets(disasm: str) -> set[int]:
+    """Extract effective VAs referenced via ADRP + ADD/LDR/LDP in AArch64 disassembly."""
+    targets: set[int] = set()
+    pages: dict[str, int] = {}
+    for raw_line in disasm.splitlines():
+        line = INSN_PREFIX_RE.sub('', raw_line.split(';', 1)[0].strip())
+        line = ' '.join(line.split())
+        if not line:
+            continue
+        m_adrp = re.match(r'^adrp\s+(x\d+),\s*(?:0x)?([0-9a-f]+)\b', line, re.I)
+        if m_adrp:
+            pages[m_adrp.group(1).lower()] = int(m_adrp.group(2), 16)
+            continue
+        m_add = re.match(
+            r'^add\s+(x\d+),\s*(x\d+),\s*#((?:0x)?[0-9a-f]+)\b', line, re.I
+        )
+        if m_add:
+            dst, src = m_add.group(1).lower(), m_add.group(2).lower()
+            imm = int(m_add.group(3), 0)
+            if src in pages:
+                targets.add(pages[src] + imm)
+            pages.pop(dst, None)
+            continue
+        m_ldr = re.match(
+            r'^ldr\w*\s+[wx](\d+),\s*\[(x\d+)(?:,\s*#((?:0x)?[0-9a-f]+))?\]',
+            line,
+            re.I,
+        )
+        if m_ldr:
+            dst_num, src = m_ldr.group(1), m_ldr.group(2).lower()
+            imm = int(m_ldr.group(3), 0) if m_ldr.group(3) else 0
+            if src in pages:
+                targets.add(pages[src] + imm)
+            pages.pop(f'x{dst_num}', None)
+            continue
+        m_ldp = re.match(
+            r'^ldp\s+[wx](\d+),\s*[wx](\d+),\s*\[(x\d+)(?:,\s*#((?:0x)?[0-9a-f]+))?\]',
+            line,
+            re.I,
+        )
+        if m_ldp:
+            d1, d2, src = m_ldp.group(1), m_ldp.group(2), m_ldp.group(3).lower()
+            imm = int(m_ldp.group(4), 0) if m_ldp.group(4) else 0
+            if src in pages:
+                targets.add(pages[src] + imm)
+            pages.pop(f'x{d1}', None)
+            pages.pop(f'x{d2}', None)
+            continue
+        if re.match(r'^blr?\b', line, re.I):
+            for idx in range(19):
+                pages.pop(f'x{idx}', None)
+            continue
+        if re.match(r'^(?:st\w*|cbn?z|tbn?z|cmp|cmn|tst|b(?:\.\w+)?)\b', line, re.I):
+            continue
+        m_write = re.match(r'^[a-z][a-z0-9.]*\s+[wx](\d+)\b', line, re.I)
+        if m_write:
+            pages.pop(f'x{m_write.group(1)}', None)
+    return targets
 
 
 def parse_kconfig_fragment(text: str) -> dict[str, str]:
@@ -53,9 +116,8 @@ def _find_llvm_tool(name: str) -> str:
     raise FileNotFoundError(f'LLVM tool not found: {name}')
 
 
-def _disassemble_symbol(kernel_path: Path, symbol: str) -> str:
+def _parse_nm_symbols(kernel_path: Path) -> list[tuple[int, str]]:
     llvm_nm = _find_llvm_tool('llvm-nm')
-    llvm_objdump = _find_llvm_tool('llvm-objdump')
     nm_out = subprocess.check_output([llvm_nm, '-n', str(kernel_path)], text=True)
     addrs: list[tuple[int, str]] = []
     for line in nm_out.splitlines():
@@ -65,10 +127,21 @@ def _disassemble_symbol(kernel_path: Path, symbol: str) -> str:
                 addrs.append((int(parts[0], 16), parts[2]))
             except ValueError:
                 continue
+    return addrs
+
+
+def _lookup_symbol(addrs: list[tuple[int, str]], symbol: str, kernel_path: Path) -> int:
     start = next((addr for addr, name in addrs if name == symbol), None)
     if start is None:
         raise AssertionError(f'Symbol {symbol} not found in {kernel_path}')
-    stop = next((addr for addr, _ in addrs if addr > start), None)
+    return start
+
+
+def _disassemble_symbol(kernel_path: Path, symbol: str, addrs: list[tuple[int, str]] | None = None) -> str:
+    llvm_objdump = _find_llvm_tool('llvm-objdump')
+    sym_table = addrs if addrs is not None else _parse_nm_symbols(kernel_path)
+    start = _lookup_symbol(sym_table, symbol, kernel_path)
+    stop = next((addr for addr, _ in sym_table if addr > start), None)
     if stop is None:
         raise AssertionError(f'No following symbol after {symbol} in {kernel_path}')
     return subprocess.check_output(
@@ -102,6 +175,35 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         ])
         self.assertEqual(check_pe_create_console_disasm(good_disasm), [])
 
+    def test_find_adrp_load_targets_extracts_exact_va(self):
+        snippet = '\n'.join([
+            'fffffff00788bce4: d000135b \tadrp\tx27, 0xfffffff007af5000',
+            'fffffff00788bce8: f9409f61 \tldr\tx1, [x27, #0x138]',
+            'fffffff00788bcec: b0001348 \tadrp\tx8, 0xfffffff007af4000',
+            'fffffff00788bcf0: 9122a108 \tadd\tx8, x8, #0x8a8',
+            'fffffff00788bcf4: f9400108 \tldr\tx8, [x8]',
+            'fffffff00788bcf8: d000135c \tadrp\tx28, 0xfffffff007af6000',
+            'fffffff00788bcfc: d280001c \tmov\tx28, #0x0',
+            'fffffff00788bd00: f9400380 \tldr\tx0, [x28, #0x10]',
+        ])
+        targets = find_adrp_load_targets(snippet)
+        self.assertIn(0xFFFFFFF007AF5138, targets)
+        self.assertIn(0xFFFFFFF007AF48A8, targets)
+        self.assertNotIn(0xFFFFFFF007AF6010, targets)
+
+    def test_series_includes_fdt_phandle_alias_patch(self):
+        series_lines = [
+            line.strip()
+            for line in PATCH_SERIES_PATH.read_text(encoding='utf-8').splitlines()
+            if line.strip() and not line.strip().startswith('#')
+        ]
+        self.assertIn('iokit-fdt-phandle-alias.patch', series_lines)
+        self.assertTrue(PHANDLE_ALIAS_PATCH.is_file(), f'Missing patch: {PHANDLE_ALIAS_PATCH}')
+        patch_text = PHANDLE_ALIAS_PATCH.read_text(encoding='utf-8')
+        self.assertIn('iokit/Kernel/IODeviceTreeSupport.cpp', patch_text)
+        self.assertIn('gIODTPHandleKey', patch_text)
+        self.assertIn('"phandle"', patch_text)
+
     def test_built_kernel_pe_create_console(self):
         kernel = os.environ.get('SM6125_KERNEL_MACHO', '').strip()
         if not kernel:
@@ -110,6 +212,17 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         self.assertTrue(kernel_path.is_file(), f'Kernel not found: {kernel_path}')
         disasm = _disassemble_symbol(kernel_path, '_PE_create_console')
         self.assertEqual(check_pe_create_console_disasm(disasm, require_dt_probe=True), [])
+
+    def test_built_kernel_make_reference_table_aliases_phandle(self):
+        kernel = os.environ.get('SM6125_KERNEL_MACHO', '').strip()
+        if not kernel:
+            self.skipTest('SM6125_KERNEL_MACHO not set')
+        kernel_path = Path(kernel)
+        self.assertTrue(kernel_path.is_file(), f'Kernel not found: {kernel_path}')
+        addrs = _parse_nm_symbols(kernel_path)
+        phandle_key_va = _lookup_symbol(addrs, '_gIODTPHandleKey', kernel_path)
+        disasm = _disassemble_symbol(kernel_path, '__ZL18MakeReferenceTablePK13OpaqueDTEntryb', addrs=addrs)
+        self.assertIn(phandle_key_va, find_adrp_load_targets(disasm))
 
 
 if __name__ == '__main__':
