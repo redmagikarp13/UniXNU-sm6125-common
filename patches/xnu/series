@@ -1,1 +1,5 @@
-# SM6125 XNU patches (Marco 2+)
+# SM6125 XNU patches
+# native-smp-secondary: MAX_CPUS=8 e máscara Affinity1 0xFFFF em start.s (SM6125 usa 0x0..0x3 e 0x100..0x103)
+# sheng-platform-power: bloco #if XNU_SHENG_PMGR em bsd_init.c exigido como contexto por zzz-boot-progress.patch (compila vazio com XNU_SHENG_PMGR=0)
+arch:../../../patches/xnu/native-smp-secondary.patch
+arch:../../../patches/xnu/sheng-platform-power.patch
