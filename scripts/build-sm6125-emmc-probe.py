@@ -195,7 +195,7 @@ def main() -> None:
         'core_source_sha256': hashlib.sha256(core_src.read_bytes()).hexdigest(),
         'cpp_source_sha256': hashlib.sha256(cpp_src.read_bytes()).hexdigest(),
         'archive_sha256': digest,
-        'mode': 'SM6125 GCC SDCC1 + SDHCI-MSM v5 probe (mode=1 read-only snapshot, mode=2 ident+GPT PIO)',
+        'mode': 'SM6125 GCC SDCC1 + SDHCI-MSM v5 probe (mode=1 read-only snapshot, mode=2 ident+GPT PIO, mode=3 HS50/ADMA2/DDR52)',
     }
     (OUT / 'build-report.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     print(f'PASS: Sm6125EmmcProbe ({archive} sha256 {digest})')

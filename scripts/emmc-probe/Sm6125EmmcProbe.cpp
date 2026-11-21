@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
-// Sonda GCC SDCC1 + SDHCI-MSM v5 (SM6125): modo 1 somente-leitura, modo 2 ident+GPT via PIO.
+// Sonda GCC SDCC1 + SDHCI-MSM v5 (SM6125): modos 1 (RO), 2 (ident+GPT PIO), 3 (HS50/ADMA2/DDR52).
 #include "Sm6125EmmcCore.h"
 #include "Sm6125EmmcReadOnly.h"
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IORegistryEntry.h>
+#include <kern/task.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
@@ -59,6 +61,20 @@ static void sm6125_emmc_delay_us(uint32_t microseconds)
   IODelay(microseconds);
 }
 
+static uint64_t sm6125_emmc_now_us(void)
+{
+  uint64_t cnt = 0;
+  uint64_t frq = 0;
+  __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(cnt));
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+  if (frq == 0u) {
+    return 0u;
+  }
+  const uint64_t sec = cnt / frq;
+  const uint64_t rem = cnt % frq;
+  return sec * 1000000ULL + (rem * 1000000ULL) / frq;
+}
+
 }  // extern "C"
 
 static const sm6125_mmio_ro_ops_t kReadOnlyMmioOps = {
@@ -75,7 +91,40 @@ static const sm6125_emmc_hw_ops_t kIdentMmioOps = {
     .write16 = sm6125_mmio_write16,
     .write32 = sm6125_mmio_write32,
     .delay_us = sm6125_emmc_delay_us,
+    .now_us = sm6125_emmc_now_us,
 };
+
+struct Sm6125DmaCacheCtx {
+  IOBufferMemoryDescriptor *desc_md;
+  IOBufferMemoryDescriptor *data_md;
+};
+
+static void dma_cache_clean_desc(void *ctx, size_t offset, size_t len)
+{
+  auto *c = static_cast<Sm6125DmaCacheCtx *>(ctx);
+  if (c && c->desc_md) {
+    c->desc_md->performOperation(kIOMemoryIncoherentIOStore, offset, len);
+    __asm__ volatile("dsb sy" : : : "memory");
+  }
+}
+
+static void dma_cache_flush_data(void *ctx, size_t offset, size_t len)
+{
+  auto *c = static_cast<Sm6125DmaCacheCtx *>(ctx);
+  if (c && c->data_md) {
+    c->data_md->performOperation(kIOMemoryIncoherentIOFlush, offset, len);
+    __asm__ volatile("dsb sy" : : : "memory");
+  }
+}
+
+static void dma_cache_invalidate_data(void *ctx, size_t offset, size_t len)
+{
+  auto *c = static_cast<Sm6125DmaCacheCtx *>(ctx);
+  if (c && c->data_md) {
+    c->data_md->performOperation(kIOMemoryIncoherentIOFlush, offset, len);
+    __asm__ volatile("dsb sy" : : : "memory");
+  }
+}
 
 __attribute__((noreturn)) static void panic_with_snapshot(const sm6125_emmc_ro_snapshot_t *snap)
 {
@@ -164,6 +213,80 @@ static bool map_mmio_window(
   return true;
 }
 
+static bool alloc_dma_buf(
+    IOBufferMemoryDescriptor **out_desc_md,
+    IOBufferMemoryDescriptor **out_data_md,
+    Sm6125DmaCacheCtx *ctx,
+    sm6125_emmc_dma_buf_t *out_dma)
+{
+  constexpr size_t kDescBytes = 4096u;
+  constexpr size_t kXferBytes = 32768u;
+  constexpr size_t kCanaryBytes = 4096u;
+  constexpr size_t kDataTotal = kXferBytes + kCanaryBytes;
+  constexpr mach_vm_address_t kLow4GMask = 0x00000000FFFFF000ULL;
+  constexpr IOOptionBits kOpts =
+      static_cast<IOOptionBits>(kIODirectionInOut) |
+      static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous);
+
+  IOBufferMemoryDescriptor *desc_md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+      kernel_task, kOpts, kDescBytes, kLow4GMask);
+  IOBufferMemoryDescriptor *data_md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+      kernel_task, kOpts, kDataTotal, kLow4GMask);
+  if (!desc_md || !data_md) {
+    OSSafeReleaseNULL(data_md);
+    OSSafeReleaseNULL(desc_md);
+    return false;
+  }
+  if (desc_md->prepare(kIODirectionInOut) != kIOReturnSuccess) {
+    OSSafeReleaseNULL(data_md);
+    OSSafeReleaseNULL(desc_md);
+    return false;
+  }
+  if (data_md->prepare(kIODirectionInOut) != kIOReturnSuccess) {
+    desc_md->complete(kIODirectionInOut);
+    OSSafeReleaseNULL(data_md);
+    OSSafeReleaseNULL(desc_md);
+    return false;
+  }
+
+  IOByteCount desc_seg = 0;
+  IOByteCount data_seg = 0;
+  const addr64_t desc_pa = desc_md->getPhysicalSegment(0, &desc_seg, kIOMemoryMapperNone);
+  const addr64_t data_pa = data_md->getPhysicalSegment(0, &data_seg, kIOMemoryMapperNone);
+  auto *desc_va = static_cast<uint8_t *>(desc_md->getBytesNoCopy());
+  auto *data_va = static_cast<uint8_t *>(data_md->getBytesNoCopy());
+  if (!desc_va || !data_va || !desc_pa || !data_pa ||
+      desc_seg < kDescBytes || data_seg < kDataTotal ||
+      desc_pa > (0xFFFFFFFFULL - kDescBytes + 1ULL) ||
+      data_pa > (0xFFFFFFFFULL - kDataTotal + 1ULL)) {
+    data_md->complete(kIODirectionInOut);
+    desc_md->complete(kIODirectionInOut);
+    OSSafeReleaseNULL(data_md);
+    OSSafeReleaseNULL(desc_md);
+    return false;
+  }
+
+  ctx->desc_md = desc_md;
+  ctx->data_md = data_md;
+  memset(out_dma, 0, sizeof(*out_dma));
+  out_dma->desc_va = desc_va;
+  out_dma->desc_pa = desc_pa;
+  out_dma->desc_size = kDescBytes;
+  out_dma->data_va = data_va;
+  out_dma->data_pa = data_pa;
+  out_dma->data_size = kDataTotal;
+  out_dma->canary_offset = kXferBytes;
+  out_dma->canary_size = kCanaryBytes;
+  out_dma->cache_clean_desc = dma_cache_clean_desc;
+  out_dma->cache_flush_data = dma_cache_flush_data;
+  out_dma->cache_invalidate_data = dma_cache_invalidate_data;
+  out_dma->cache_ctx = ctx;
+
+  *out_desc_md = desc_md;
+  *out_data_md = data_md;
+  return true;
+}
+
 extern "C" void sm6125_emmc_probe_run(void)
 {
   uint32_t arg_val = 0;
@@ -187,9 +310,7 @@ extern "C" void sm6125_emmc_probe_run(void)
     panic_with_snapshot(&snap);
   }
 
-  if (mode == SM6125_EMMC_PROBE_MODE_IDENT_GPT) {
-    sm6125_emmc_ident_report_t rep;
-    memset(&rep, 0, sizeof(rep));
+  if (mode == SM6125_EMMC_PROBE_MODE_IDENT_GPT || mode == SM6125_EMMC_PROBE_MODE_FAST_BENCH) {
     IOMemoryDescriptor *gcc_desc = nullptr;
     IOMemoryMap *gcc_map = nullptr;
     IOMemoryDescriptor *sdhci_desc = nullptr;
@@ -208,17 +329,45 @@ extern "C" void sm6125_emmc_probe_run(void)
       snap.err = SM6125_EMMC_RO_ERR_MAP_SDHCI;
       panic_with_snapshot(&snap);
     }
-    sm6125_emmc_ident_gpt_run(
-        &kIdentMmioOps,
-        static_cast<uintptr_t>(gcc_map->getVirtualAddress()),
-        static_cast<uintptr_t>(sdhci_map->getVirtualAddress()),
-        &rep);
+
+    const uintptr_t gcc_va = static_cast<uintptr_t>(gcc_map->getVirtualAddress());
+    const uintptr_t sdhci_va = static_cast<uintptr_t>(sdhci_map->getVirtualAddress());
+    char buf[768];
+
+    if (mode == SM6125_EMMC_PROBE_MODE_IDENT_GPT) {
+      sm6125_emmc_ident_report_t rep;
+      memset(&rep, 0, sizeof(rep));
+      sm6125_emmc_ident_gpt_run(&kIdentMmioOps, gcc_va, sdhci_va, &rep);
+      OSSafeReleaseNULL(sdhci_map);
+      OSSafeReleaseNULL(sdhci_desc);
+      OSSafeReleaseNULL(gcc_map);
+      OSSafeReleaseNULL(gcc_desc);
+      sm6125_emmc_ident_format_report(&rep, buf, sizeof(buf));
+      panic("%s", buf);
+    }
+
+    IOBufferMemoryDescriptor *desc_md = nullptr;
+    IOBufferMemoryDescriptor *data_md = nullptr;
+    Sm6125DmaCacheCtx dma_ctx = {};
+    sm6125_emmc_dma_buf_t dma = {};
+    const bool has_dma = alloc_dma_buf(&desc_md, &data_md, &dma_ctx, &dma);
+
+    sm6125_emmc_fast_report_t fast_rep;
+    memset(&fast_rep, 0, sizeof(fast_rep));
+    sm6125_emmc_fast_bench_run(
+        &kIdentMmioOps, gcc_va, sdhci_va, has_dma ? &dma : nullptr, &fast_rep);
+
+    if (has_dma) {
+      data_md->complete(kIODirectionInOut);
+      desc_md->complete(kIODirectionInOut);
+      OSSafeReleaseNULL(data_md);
+      OSSafeReleaseNULL(desc_md);
+    }
     OSSafeReleaseNULL(sdhci_map);
     OSSafeReleaseNULL(sdhci_desc);
     OSSafeReleaseNULL(gcc_map);
     OSSafeReleaseNULL(gcc_desc);
-    char buf[768];
-    sm6125_emmc_ident_format_report(&rep, buf, sizeof(buf));
+    sm6125_emmc_fast_format_report(&fast_rep, buf, sizeof(buf));
     panic("%s", buf);
   }
 

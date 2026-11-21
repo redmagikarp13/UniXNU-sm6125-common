@@ -22,6 +22,10 @@ enum {
   SM6125_SDHCI_RESPONSE3 = 0x01Cu,
   SM6125_SDHCI_BUFFER = 0x020u,
   SM6125_SDHCI_TIMEOUT_CONTROL = 0x02Eu,
+  SM6125_SDHCI_AUTO_CMD_STATUS = 0x03Cu,
+  SM6125_SDHCI_ADMA_ERROR = 0x054u,
+  SM6125_SDHCI_ADMA_ADDRESS = 0x058u,
+  SM6125_SDHCI_ADMA_ADDRESS_HI = 0x05Cu,
 
   SM6125_SDHCI_V5_PWRCTL_CLEAR = 0x248u,
   SM6125_SDHCI_V5_PWRCTL_CTL = 0x24Cu,
@@ -49,6 +53,18 @@ enum {
   SM6125_EMMC_STEP_READ_GPT_ARRAY = 18u,
   SM6125_EMMC_STEP_READ_GPT_BACKUP = 19u,
   SM6125_EMMC_STEP_DONE = 20u,
+  SM6125_EMMC_STEP_HS_CMD6 = 21u,
+  SM6125_EMMC_STEP_HS_8BIT_CMD6 = 22u,
+  SM6125_EMMC_STEP_GCC_50M = 23u,
+  SM6125_EMMC_STEP_HS_PIO_GPT = 24u,
+  SM6125_EMMC_STEP_HS_PIO_BENCH = 25u,
+  SM6125_EMMC_STEP_HS_ADMA_GPT = 26u,
+  SM6125_EMMC_STEP_HS_ADMA_BENCH = 27u,
+  SM6125_EMMC_STEP_DDR_CMD6 = 28u,
+  SM6125_EMMC_STEP_GCC_100M = 29u,
+  SM6125_EMMC_STEP_DDR_ADMA_GPT = 30u,
+  SM6125_EMMC_STEP_DDR_ADMA_BENCH = 31u,
+  SM6125_EMMC_STEP_FAST_DONE = 32u,
 };
 
 enum {
@@ -72,6 +88,12 @@ enum {
   SM6125_EMMC_RC_BAD_GPT_PARTS = -17,
   SM6125_EMMC_RC_NO_USERDATA = -18,
   SM6125_EMMC_RC_BAD_GPT_BACKUP = -19,
+  SM6125_EMMC_RC_SWITCH_ERROR = -20,
+  SM6125_EMMC_RC_EXT_CSD_MISMATCH = -21,
+  SM6125_EMMC_RC_ADMA_ERROR = -22,
+  SM6125_EMMC_RC_AUTO_CMD_ERROR = -23,
+  SM6125_EMMC_RC_CANARY_CORRUPT = -24,
+  SM6125_EMMC_RC_DATA_MISMATCH = -25,
 };
 
 typedef struct {
@@ -82,7 +104,78 @@ typedef struct {
   void (*write16)(uintptr_t base, uint32_t offset, uint16_t value);
   void (*write32)(uintptr_t base, uint32_t offset, uint32_t value);
   void (*delay_us)(uint32_t microseconds);
+  uint64_t (*now_us)(void);
 } sm6125_emmc_hw_ops_t;
+
+enum {
+  SM6125_EMMC_FAST_MODE_NONE = 0u,
+  SM6125_EMMC_FAST_MODE_HS50_PIO = 1u,
+  SM6125_EMMC_FAST_MODE_HS50_ADMA = 2u,
+  SM6125_EMMC_FAST_MODE_DDR52_ADMA = 3u,
+};
+
+typedef struct {
+  uint8_t *desc_va;
+  uint64_t desc_pa;
+  size_t desc_size;
+  uint8_t *data_va;
+  uint64_t data_pa;
+  size_t data_size;
+  size_t canary_offset;
+  size_t canary_size;
+  void (*cache_clean_desc)(void *ctx, size_t offset, size_t len);
+  void (*cache_flush_data)(void *ctx, size_t offset, size_t len);
+  void (*cache_invalidate_data)(void *ctx, size_t offset, size_t len);
+  void *cache_ctx;
+} sm6125_emmc_dma_buf_t;
+
+typedef struct {
+  bool ok;
+  uint32_t active_mode;
+  uint32_t step;
+  int32_t rc;
+
+  bool hs50_pio_ok;
+  int32_t hs50_pio_rc;
+  uint32_t hs50_pio_kibs;
+  uint32_t hs50_pio_us;
+
+  bool hs50_adma_ok;
+  int32_t hs50_adma_rc;
+  uint32_t hs50_adma_kibs;
+  uint32_t hs50_adma_us;
+  uint32_t hs50_adma_crc;
+
+  bool ddr52_ok;
+  int32_t ddr52_rc;
+  uint32_t ddr52_kibs;
+  uint32_t ddr52_us;
+  uint32_t ddr52_crc;
+
+  uint8_t hs_timing;
+  uint8_t device_type;
+  uint32_t ext_csd_ro_crc;
+  uint32_t gpt_parts_crc;
+  uint32_t acfg;
+  uint16_t clk;
+  uint8_t hc;
+  uint16_t hc2;
+  uint32_t vs;
+  uint32_t ddr_cfg;
+  uint32_t dll;
+
+  bool fail_valid;
+  uint32_t fail_rung;
+  uint32_t fail_step;
+  int32_t fail_rc;
+  uint32_t fail_cmd;
+  uint32_t fail_arg;
+  uint32_t fail_is;
+  uint32_t fail_ps;
+  uint32_t fail_r0;
+  uint16_t fail_acmd;
+  uint8_t fail_adma_err;
+} sm6125_emmc_fast_report_t;
 
 typedef struct {
   bool ok;
@@ -141,6 +234,18 @@ int32_t sm6125_emmc_ident_gpt_run(
 
 size_t sm6125_emmc_ident_format_report(
     const sm6125_emmc_ident_report_t *rep,
+    char *buf,
+    size_t cap);
+
+int32_t sm6125_emmc_fast_bench_run(
+    const sm6125_emmc_hw_ops_t *ops,
+    uintptr_t gcc_sdcc1_va,
+    uintptr_t sdhci_va,
+    const sm6125_emmc_dma_buf_t *dma_buf,
+    sm6125_emmc_fast_report_t *out);
+
+size_t sm6125_emmc_fast_format_report(
+    const sm6125_emmc_fast_report_t *rep,
     char *buf,
     size_t cap);
 

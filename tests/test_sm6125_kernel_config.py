@@ -282,6 +282,7 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         names = {name for _, name in addrs}
         self.assertIn('_sm6125_emmc_probe_run', names)
         self.assertIn('_sm6125_emmc_ident_gpt_run', names)
+        self.assertIn('_sm6125_emmc_fast_bench_run', names)
         bsd_init_disasm = _disassemble_symbol(kernel_path, '_bsd_init', addrs=addrs)
         self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_sm6125_emmc_probe_run>')
 
