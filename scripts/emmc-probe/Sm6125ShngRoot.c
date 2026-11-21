@@ -74,6 +74,9 @@ uint32_t sm6125_emmc_block_select_mode(bool has_arg, uint32_t arg_value) {
     return SM6125_EMMC_BLOCK_MODE_DIAG;
   }
   if (arg_value == 2u) {
+    return SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG;
+  }
+  if (arg_value == 3u) {
     return SM6125_EMMC_BLOCK_MODE_PUBLISH;
   }
   return SM6125_EMMC_BLOCK_MODE_INVALID;

@@ -10,7 +10,7 @@
  
  #if SOCKETS
  #if CONFIG_MBUF_MCACHE
-@@ -933,6 +936,9 @@ bsd_init(void)
+@@ -933,7 +936,10 @@ bsd_init(void)
  #if (DEVELOPMENT || DEBUG) && defined(XNU_NATIVE_OFFLINE_GPU) && XNU_NATIVE_OFFLINE_GPU
  	extern void native_offline_gpu_publish(void);
  	native_offline_gpu_publish();
@@ -21,3 +21,67 @@
  
  	/*
  	 * We attach the loopback interface *way* down here to ensure
+@@ -1069,6 +1075,10 @@ bsd_init(void)
+ 		require_rootauth = TRUE;
+ #endif // XNU_TARGET_OS_OSX && defined(__arm64__)
+ 
++#undef XNU_OWNER_ROOT_AUDIT
++#define XNU_OWNER_ROOT_AUDIT 1
++#undef XNU_OWNER_ROOT_TRUST
++#define XNU_OWNER_ROOT_TRUST 1
+ 		if (require_rootauth) {
+ 			/* enforce sealedness */
+ 			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -566,6 +566,8 @@ IOGetBootManifestHash(char *hash_data, size_t *hash_data_size)
+ 	return result;
+ }
+ 
++#undef XNU_OWNER_BOOT_MANIFEST
++#define XNU_OWNER_BOOT_MANIFEST 1
+ #if defined(XNU_OWNER_BOOT_MANIFEST) && XNU_OWNER_BOOT_MANIFEST
+ #if !DEVELOPMENT && !DEBUG
+ #error Owner image-set metadata is an offline development instrument
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7016,6 +7016,14 @@
+  *		word width of the kernel. Once the self-exec completes, the
+  *		initproc might be different.
+  */
++#undef XNU_OWNER_CACHE_MOUNT
++#define XNU_OWNER_CACHE_MOUNT 1
++#undef XNU_OWNER_CACHE_STARTUP
++#define XNU_OWNER_CACHE_STARTUP 1
++#undef XNU_OWNER_BOOT_MANIFEST
++#define XNU_OWNER_BOOT_MANIFEST 1
++#undef XNU_OWNER_UNION_SYSTEMOS
++#define XNU_OWNER_UNION_SYSTEMOS 1
+ #if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT
+ #if !DEVELOPMENT && !DEBUG
+ #error The offline owner cache mount is a development instrument
+@@ -7175,6 +7183,24 @@ native_owner_cache_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
+ 	native_owner_cache_authorized = cache_authorized;
+ 	native_owner_cache_status = error;
+ 	native_owner_cache_checkpoint(error, cache_authorized);
++	{
++		extern void sm6125_emmc_post_mount_check(int, int, int, int);
++		vnode_t vp_launchd = NULLVP, vp_dyld = NULLVP, vp_dsc = NULLVP;
++		int launchd_ok = 0, dyld_ok = 0, dsc_ok = 0;
++		if (vnode_lookup("/sbin/launchd", 0, &vp_launchd, vfs_context_current()) == 0) {
++			launchd_ok = 1;
++			vnode_put(vp_launchd);
++		}
++		if (vnode_lookup("/usr/lib/dyld", 0, &vp_dyld, vfs_context_current()) == 0) {
++			dyld_ok = 1;
++			vnode_put(vp_dyld);
++		}
++		if (vnode_lookup("/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64", 0, &vp_dsc, vfs_context_current()) == 0) {
++			dsc_ok = 1;
++			vnode_put(vp_dsc);
++		}
++		sm6125_emmc_post_mount_check(error, launchd_ok, dyld_ok, dsc_ok);
++	}
+ 	return error;
+ }
+ #endif

@@ -288,10 +288,25 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         self.assertIn('_sm6125_emmc_ctrl_read_sectors', names)
         self.assertIn('_sm6125_shngroot_parse', names)
         self.assertIn('_sm6125_emmc_block_late_init', names)
+        self.assertIn('_sm6125_emmc_post_mount_check', names)
+        self.assertIn('_vr_open', names)
+        self.assertIn('_vr_open_header', names)
+        self.assertIn('_vr_verify_block', names)
+        self.assertIn('_vr_xnu_crypto', names)
+        self.assertIn('_native_verified_block_root_authorized', names)
+        self.assertIn('_native_verified_block_manifest_sha384', names)
+        self.assertIn('_native_verified_block_volume_device', names)
+        self.assertIn('_native_owner_publish_boot_manifest', names)
         self.assertIn('__ZTV15Sm6125EmmcBlock', names)
+        board_toml = tomllib.loads(BOARD_TOML_PATH.read_text(encoding='utf-8'))
+        self.assertEqual(
+            board_toml.get('payload', {}).get('adt', {}).get('root_match_volume_uuid'),
+            '04769D26-2CA0-4825-B443-E2E5F88300F2',
+        )
         bsd_init_disasm = _disassemble_symbol(kernel_path, '_bsd_init', addrs=addrs)
         self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_sm6125_emmc_probe_run>')
         self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_sm6125_emmc_block_late_init>')
+        self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_native_verified_block_root_authorized>')
 
         load_re = re.compile(r'^(?:ld|cas|swp)', re.IGNORECASE)
         store_re = re.compile(r'^(?:st|cas|swp|ldadd|ldclr|ldeor|ldset)', re.IGNORECASE)

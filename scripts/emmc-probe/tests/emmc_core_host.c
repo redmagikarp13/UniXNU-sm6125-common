@@ -1212,8 +1212,9 @@ static int test_ctrl_and_shngroot_suite(void) {
   assert(sm6125_emmc_block_select_mode(false, 0u) == SM6125_EMMC_BLOCK_MODE_OFF);
   assert(sm6125_emmc_block_select_mode(true, 0u) == SM6125_EMMC_BLOCK_MODE_OFF);
   assert(sm6125_emmc_block_select_mode(true, 1u) == SM6125_EMMC_BLOCK_MODE_DIAG);
-  assert(sm6125_emmc_block_select_mode(true, 2u) == SM6125_EMMC_BLOCK_MODE_PUBLISH);
-  assert(sm6125_emmc_block_select_mode(true, 3u) == SM6125_EMMC_BLOCK_MODE_INVALID);
+  assert(sm6125_emmc_block_select_mode(true, 2u) == SM6125_EMMC_BLOCK_MODE_MOUNT_DIAG);
+  assert(sm6125_emmc_block_select_mode(true, 3u) == SM6125_EMMC_BLOCK_MODE_PUBLISH);
+  assert(sm6125_emmc_block_select_mode(true, 4u) == SM6125_EMMC_BLOCK_MODE_INVALID);
 
   /* 2. sm6125_emmc_ctrl_init happy path (DDR52 + ADMA2) + single & multi-chunk read_sectors */
   init_hw_from_real_gpt();
@@ -1345,11 +1346,16 @@ static int test_ctrl_and_shngroot_suite(void) {
     assert(fread(hdr, 1u, 4096u, uf) == 4096u);
     fclose(uf);
     assert(sm6125_shngroot_parse(hdr, part_cap, host_sha256, &man) == SM6125_SHNGROOT_RC_OK);
-    assert(man.window_count == 2u);
+    assert(man.version == 2u && man.entry_count == 4u);
+    assert(man.window_count == 2u && man.object_count == 2u);
     assert(strcmp(man.entries[0].name, "OS") == 0 && man.entries[0].offset == 0x100000ULL &&
            man.entries[0].size == 6077580800ULL);
     assert(strcmp(man.entries[1].name, "SystemOS") == 0 && man.entries[1].offset == 0x16A600000ULL &&
            man.entries[1].size == 3303014400ULL);
+    assert(strcmp(man.entries[2].name, "OS.vroot") == 0 && man.entries[2].offset == 0x22F400000ULL &&
+           man.entries[2].size == 47481120ULL && man.entries[2].flags == 3u);
+    assert(strcmp(man.entries[3].name, "SystemOS.vroot") == 0 && man.entries[3].offset == 0x232200000ULL &&
+           man.entries[3].size == 25804800ULL && man.entries[3].flags == 3u);
   }
   return 26;
 }
