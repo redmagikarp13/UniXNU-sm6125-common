@@ -9,6 +9,13 @@
 	#size-cells = <2>;
 	compatible = "qcom,sm6125";
 
+	/*
+	 * MAX_CPU_CLUSTERS é 1 no build BCM2837 atual (board_config.h), então
+	 * unixnu,cluster-type = "P" faz phys_cluster_id = 1 e dispara
+	 * assert(phys_cluster_id <= MAX_CPU_CLUSTER_PHY_ID) (ou escrita fora de
+	 * bounds na pilha) em ml_parse_cpu_topology() antes da console subir.
+	 * Tags E/P só podem voltar junto com patch de MAX_CPU_CLUSTERS >= 2 / AMP.
+	 */
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -18,56 +25,48 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x0>;
-			unixnu,cluster-type = "E";
 		};
 
 		cpu@1 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x1>;
-			unixnu,cluster-type = "E";
 		};
 
 		cpu@2 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x2>;
-			unixnu,cluster-type = "E";
 		};
 
 		cpu@3 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			reg = <0x0 0x3>;
-			unixnu,cluster-type = "E";
 		};
 
 		cpu@100 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a73";
 			reg = <0x0 0x100>;
-			unixnu,cluster-type = "P";
 		};
 
 		cpu@101 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a73";
 			reg = <0x0 0x101>;
-			unixnu,cluster-type = "P";
 		};
 
 		cpu@102 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a73";
 			reg = <0x0 0x102>;
-			unixnu,cluster-type = "P";
 		};
 
 		cpu@103 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a73";
 			reg = <0x0 0x103>;
-			unixnu,cluster-type = "P";
 		};
 	};
 
