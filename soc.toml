@@ -19,6 +19,7 @@ archives = [
   "build-libpthread-kernel.py",
   "build-sm6125-platform-power.py",
   "build-sm6125-emmc-probe.py",
+  "build-sm6125-touch-probe.py",
   "build-sm6125-legacy-display.py",
 ]
 

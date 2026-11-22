@@ -8,13 +8,14 @@ Camada comum do SoC **Qualcomm Snapdragon 665 (`SM6125`)** para o port **UniXNU*
 - **`scripts/emmc-probe/Sm6125ShngRoot.{h,c}`**: parser e validador de manifesto `SHNGROOT` v1/v2 (janelas `OS`/`SystemOS` e objetos `VerifiedRoot`).
 - **`scripts/emmc-probe/Sm6125EmmcBlock.cpp`**: classe `IOBlockStorageDevice` com registro late-metaclass, integração `VerifiedRoot` (RSA-3072), ponte `native_ufs_store_*` para `NativeRamBlock` (`PersistOverlay` `SHNGDATA`) e checagem de integridade GPT.
 - **`scripts/build-sm6125-legacy-display.py`**: construtor e adaptador `NativeLegacyDisplay` para `IOMobileFramebufferLegacy` (ABI `ipados-17.7.11-21H461`) + integração `AppleKeyStoreState` sem `__mod_init_func`, com registro late-probe em `/arm-io/gop-display`.
+- **`scripts/touch-probe/` e `scripts/build-sm6125-touch-probe.py`**: sonda SPI `QUPv3 Wrap0 SE2` (`0x04a88000`) + `TLMM WEST` (`GPIO 6..9`, `87`, `88`) + protocolo Novatek `NT36672A` (`sm6125-touch=1..3`, desligada por padrão). Validada em silício real (`13bafbaa` / `ginkgo`): modo FIFO PIO (`ifd=0`), DFS (`19..120 MHz`), loopback `16/16`, SPI Mode 0 active-LOW e Chip ID `0a0000726603` (`NT36672A`) lido em `0x1F64E`.
 - **`scripts/platform-power/`**: ponte de energia/PMGR (`ApplePMGRNub`, `pmgr=2`) e hooks PSCI.
 - **`patches/xnu/`**: série de patches XNU específicos do `SM6125` (`native-smp-secondary`, `sheng-platform-power`, `platform-sleep-hook`, `iokit-fdt-phandle-alias`, `sm6125-modload-lock-order`, `sm6125-emmc-probe-hook`).
 
 ## Testes Locais (Host ASan+UBSan e Auditoria Binária)
 
 ```bash
-# 1. Suítes C do controlador eMMC em host com ASan + UBSan
+# 1. Suítes C do controlador eMMC e da sonda touch SPI em host com ASan + UBSan
 clang -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
   -I scripts/emmc-probe \
   scripts/emmc-probe/tests/emmc_core_host.c \
@@ -28,6 +29,13 @@ clang -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
   scripts/emmc-probe/tests/emmc_ro_host.c \
   scripts/emmc-probe/Sm6125EmmcReadOnly.c \
   -o /tmp/emmc_ro_host && /tmp/emmc_ro_host
+
+clang -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
+  -I scripts/touch-probe -I ../UniXNU/drivers/QcomGeniSpi \
+  scripts/touch-probe/tests/Sm6125TouchTests.c \
+  scripts/touch-probe/Sm6125NvtProbe.c \
+  ../UniXNU/drivers/QcomGeniSpi/GeniSpi.c \
+  -o /tmp/sm6125_touch_tests && /tmp/sm6125_touch_tests
 
 # 2. Auditoria de ADT, configs, MMIO e instruções ARMv8.0-A
 SM6125_KERNEL_MACHO=/path/to/mach.development.bcm2837.unstripped.noctf \

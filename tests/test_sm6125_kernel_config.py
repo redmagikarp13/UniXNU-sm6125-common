@@ -257,6 +257,7 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         parsed = parse_kconfig_fragment(CONFIG_PATH.read_text(encoding='utf-8'))
         extra_archives = parsed.get('CONFIG_XNU_EXTRA_LD_ARCHIVES', '').strip('"')
         self.assertIn('libSm6125EmmcProbe.a', extra_archives)
+        self.assertIn('libSm6125TouchProbe.a', extra_archives)
         soc_toml = tomllib.loads(SOC_TOML_PATH.read_text(encoding='utf-8'))
         archives = (
             soc_toml.get('os_overrides', {})
@@ -265,6 +266,7 @@ class Sm6125KernelConfigTests(unittest.TestCase):
             .get('archives', [])
         )
         self.assertIn('build-sm6125-emmc-probe.py', archives)
+        self.assertIn('build-sm6125-touch-probe.py', archives)
         series_lines = [
             line.strip()
             for line in PATCH_SERIES_PATH.read_text(encoding='utf-8').splitlines()
@@ -282,6 +284,9 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         addrs = _parse_nm_symbols(kernel_path)
         names = {name for _, name in addrs}
         self.assertIn('_sm6125_emmc_probe_run', names)
+        self.assertIn('_sm6125_touch_probe_run', names)
+        self.assertIn('_geni_spi_init', names)
+        self.assertIn('_sm6125_nvt_identify', names)
         self.assertIn('_sm6125_emmc_ident_gpt_run', names)
         self.assertIn('_sm6125_emmc_fast_bench_run', names)
         self.assertIn('_sm6125_emmc_ctrl_init', names)
@@ -315,6 +320,7 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         )
         bsd_init_disasm = _disassemble_symbol(kernel_path, '_bsd_init', addrs=addrs)
         self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_sm6125_emmc_probe_run>')
+        self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_sm6125_touch_probe_run>')
         self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_sm6125_emmc_block_late_init>')
         self.assertRegex(bsd_init_disasm, r'\bbl\s+.*<_native_verified_block_root_authorized>')
 

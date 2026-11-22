@@ -1,16 +1,18 @@
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -818,6 +818,9 @@ bsd_init(void)
+@@ -818,6 +818,11 @@ bsd_init(void)
  	bsd_init_kprintf("calling proc_uuid_policy_init()\n");
  	proc_uuid_policy_init();
  #endif
 +
 +	extern void sm6125_emmc_probe_run(void);
 +	sm6125_emmc_probe_run();
++	extern void sm6125_touch_probe_run(void);
++	sm6125_touch_probe_run();
  
  #if SOCKETS
  #if CONFIG_MBUF_MCACHE
-@@ -933,7 +936,10 @@ bsd_init(void)
+@@ -933,7 +938,10 @@ bsd_init(void)
  #if (DEVELOPMENT || DEBUG) && defined(XNU_NATIVE_OFFLINE_GPU) && XNU_NATIVE_OFFLINE_GPU
  	extern void native_offline_gpu_publish(void);
  	native_offline_gpu_publish();
@@ -21,7 +23,7 @@
  
  	/*
  	 * We attach the loopback interface *way* down here to ensure
-@@ -1069,6 +1075,10 @@ bsd_init(void)
+@@ -1069,6 +1077,10 @@ bsd_init(void)
  		require_rootauth = TRUE;
  #endif // XNU_TARGET_OS_OSX && defined(__arm64__)
  
