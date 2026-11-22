@@ -4,6 +4,7 @@
 #include "../Sm6125TouchBoard.h"
 #include "../Sm6125GeniFifo.h"
 #include "../Sm6125NvtProbe.h"
+#include "../Sm6125Buttons.h"
 #include "GeniSpi.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -537,11 +538,85 @@ static void test_geni_and_nvt_protocol(const char *fw_path) {
   free(fw_buf);
 }
 
+struct sim_spmi {
+  uint32_t ver;
+  uint32_t apid_map[SM6125_SPMI_MAX_APIDS];
+  uint8_t pon_rt_sts;
+  uint8_t gpio5_rt_sts;
+  uint32_t last_cmd;
+  uint32_t obs_status;
+  uint32_t obs_rdata0;
+};
+
+static uint32_t sim_spmi_rd32(void *ctx, uintptr_t base, uint32_t off) {
+  struct sim_spmi *sp = (struct sim_spmi *)ctx;
+  if (base == 0x1000u) {
+    if (off == SM6125_SPMI_ARB_VERSION_REG) return sp->ver;
+    if (off >= SM6125_SPMI_APID_MAP_V5(0) && off < SM6125_SPMI_APID_MAP_V5(SM6125_SPMI_MAX_APIDS)) {
+      return sp->apid_map[(off - SM6125_SPMI_APID_MAP_V5(0)) / 4u];
+    }
+    return 0u;
+  }
+  uint32_t ch_off = off & 0x7Fu;
+  if (ch_off == SM6125_SPMI_STATUS_REG) return sp->obs_status;
+  if (ch_off == SM6125_SPMI_RDATA0_REG) return sp->obs_rdata0;
+  return 0u;
+}
+
+static void sim_spmi_wr32(void *ctx, uintptr_t base, uint32_t off, uint32_t val) {
+  struct sim_spmi *sp = (struct sim_spmi *)ctx;
+  (void)base;
+  if ((off & 0x7Fu) == SM6125_SPMI_CMD_REG) {
+    sp->last_cmd = val;
+    uint16_t addr = (uint16_t)((val >> 4) & 0xFFFFu);
+    sp->obs_status = SM6125_SPMI_STATUS_DONE;
+    if (addr == SM6125_PMIC_PON_RT_STS) {
+      sp->obs_rdata0 = sp->pon_rt_sts;
+    } else if (addr == SM6125_PMIC_GPIO5_STATUS) {
+      sp->obs_rdata0 = sp->gpio5_rt_sts;
+    } else {
+      sp->obs_status |= 0x02u;
+    }
+  }
+}
+
+static void test_spmi_buttons_v5_and_decode(void) {
+  struct sim_spmi sp;
+  memset(&sp, 0, sizeof(sp));
+  sp.ver = SM6125_SPMI_ARB_VERSION_V5;
+  sp.apid_map[12] = (0x008u << 8); /* PON SID 0, 0x800 */
+  sp.apid_map[47] = (0x0C4u << 8); /* GPIO5 SID 0, 0xC400 */
+
+  sm6125_spmi_buttons_t dev;
+  memset(&dev, 0, sizeof(dev));
+  dev.ctx = &sp;
+  dev.rd32 = sim_spmi_rd32;
+  dev.wr32 = sim_spmi_wr32;
+  dev.core_va = 0x1000u;
+  dev.obsrvr_va = 0x2000u;
+  dev.ee = 0u;
+
+  CHECK(sm6125_spmi_buttons_init(&dev) == 0);
+  CHECK(dev.apid_pon == 12 && dev.apid_volup == 47);
+
+  uint32_t mask = 0xFFu;
+  sp.pon_rt_sts = 0u;
+  sp.gpio5_rt_sts = 1u; /* active-LOW: 1 = solto */
+  CHECK(sm6125_spmi_buttons_poll(&dev, &mask) == 0);
+  CHECK(mask == 0u);
+
+  sp.pon_rt_sts = SM6125_PMIC_PON_KPDPWR_BIT | SM6125_PMIC_PON_RESIN_BIT;
+  sp.gpio5_rt_sts = 0u; /* active-LOW: 0 = pressionado */
+  CHECK(sm6125_spmi_buttons_poll(&dev, &mask) == 0);
+  CHECK(mask == (SM6125_HID_BTN_POWER | SM6125_HID_BTN_VOLDN | SM6125_HID_BTN_VOLUP));
+}
+
 int main(int argc, char **argv) {
   const char *fw_path = (argc > 1) ? argv[1] : NULL;
   test_board_constants_and_clocks();
   test_genispi_latched_watermark_regression_and_fifo_fix();
   test_geni_and_nvt_protocol(fw_path);
-  printf("PASS: Sm6125TouchTests (board/GCC/TLMM/GENI-FIFO/NT36672A%s)\n", fw_path ? "+real-fw" : "");
+  test_spmi_buttons_v5_and_decode();
+  printf("PASS: Sm6125TouchTests (board/GCC/TLMM/GENI-FIFO/NT36672A/SPMI-Buttons%s)\n", fw_path ? "+real-fw" : "");
   return 0;
 }

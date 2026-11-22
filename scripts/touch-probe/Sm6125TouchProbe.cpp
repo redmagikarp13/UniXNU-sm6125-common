@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Sonda em estagios (desligada por padrao) para QUPv3 SE2 SPI + Novatek NT36672A no SM6125 (ginkgo).
+#include "Sm6125Buttons.h"
 #include "Sm6125GeniFifo.h"
 #include "Sm6125NvtProbe.h"
 #include "Sm6125TouchBoard.h"
@@ -24,6 +25,7 @@ void __GLOBAL__sub_I_Sm6125HidInput_cpp(void) __asm("__GLOBAL__sub_I_Sm6125HidIn
 IOService *sm6125_hid_input_allocate(void);
 kern_return_t OSKextLoadKextWithIdentifier(const char *identifier);
 void sm6125_touch_notify_sink(void);
+void sm6125_buttons_notify_sink(uint32_t mask);
 extern volatile uint32_t sm6125_touch_seq;
 extern volatile uint32_t sm6125_touch_count;
 extern volatile uint32_t sm6125_touch_hid_reports;
@@ -878,6 +880,28 @@ static void sm6125_touch_hid_thread(void *, wait_result_t)
   IOLog("Sm6125TouchHID: ready %ux%u fw=0x%02x pid=0x%04x\n",
         max_x, max_y, s.fw_info.fw_ver, s.fw_info.pid);
 
+  MappedWindow spmi_core, spmi_obsrvr;
+  sm6125_spmi_buttons_t btns;
+  memset(&btns, 0, sizeof(btns));
+  bool btns_ok = false;
+  if (map_window(SM6125_SPMI_CORE_BASE, SM6125_SPMI_CORE_SIZE, &spmi_core) &&
+      map_window(SM6125_SPMI_OBSRVR_BASE, SM6125_SPMI_OBSRVR_SIZE, &spmi_obsrvr)) {
+    btns.ctx = nullptr;
+    btns.rd32 = [](void *, uintptr_t base, uint32_t off) -> uint32_t { return touch_mmio_read32(base, off); };
+    btns.wr32 = [](void *, uintptr_t base, uint32_t off, uint32_t val) { touch_mmio_write32(base, off, val); };
+    btns.delay_us = [](void *, uint32_t us) { IODelay(us); };
+    btns.core_va = spmi_core.va;
+    btns.obsrvr_va = spmi_obsrvr.va;
+    btns.ee = 0u;
+    if (sm6125_spmi_buttons_init(&btns) == 0) {
+      btns_ok = true;
+      IOLog("Sm6125TouchHID: SPMI buttons ready (pon_apid=%d volup_apid=%d)\n",
+            btns.apid_pon, btns.apid_volup);
+    }
+  }
+  uint32_t btn_ticks = 0u;
+  uint32_t prev_btn_mask = 0u;
+
   uint32_t prev_lvl = touch_mmio_read32(touch_pins.va, SM6125_GPIO_STRIDE + 4u) & 1u;
   uint32_t prev_down_cnt = 0u;
   uint32_t idle_ticks = 0u;
@@ -890,6 +914,14 @@ static void sm6125_touch_hid_thread(void *, wait_result_t)
   for (;;) {
     IOSleep(1u);
     total_ticks++;
+    if (btns_ok && (++btn_ticks >= 20u)) {
+      btn_ticks = 0u;
+      uint32_t btn_mask = 0u;
+      if (sm6125_spmi_buttons_poll(&btns, &btn_mask) == 0 && btn_mask != prev_btn_mask) {
+        prev_btn_mask = btn_mask;
+        sm6125_buttons_notify_sink(btn_mask);
+      }
+    }
     if (diag_secs && total_ticks >= diag_secs * 1000u) {
       panic("SM6125-HID-DIAG st=%u rc=%d hid=%u/%u/%u/%x ed=%u/%u op=%x pu=%x rep=%u irq=%u rd=%u ok=%u bad=%u rec=%u cnt=%u xy=%d,%d",
             s_hid_stage, s_hid_rc,

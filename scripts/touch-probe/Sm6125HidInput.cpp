@@ -21,10 +21,13 @@ volatile int sm6125_touch_ids[12] = {};
 volatile uint32_t sm6125_hid_diag[8] = {}; /* [0]=start,[1]=drv,[2]=notify,[3]=ret,[4]=edge_calls,[5]=edge_dig,[6]=open_flags,[7]=usage */
 
 void sm6125_touch_set_sink(void (*fn)(void *), void *ctx);
+void sm6125_buttons_set_sink(void (*fn)(void *, uint32_t), void *ctx);
 }
 
 static void (*s_touch_sink)(void *) = nullptr;
 static void *s_touch_sink_ctx = nullptr;
+static void (*s_buttons_sink)(void *, uint32_t) = nullptr;
+static void *s_buttons_sink_ctx = nullptr;
 
 extern "C" void sm6125_touch_set_sink(void (*fn)(void *), void *ctx)
 {
@@ -39,6 +42,22 @@ extern "C" void sm6125_touch_notify_sink(void)
   void *ctx = s_touch_sink_ctx;
   if (fn && ctx) {
     fn(ctx);
+  }
+}
+
+extern "C" void sm6125_buttons_set_sink(void (*fn)(void *, uint32_t), void *ctx)
+{
+  s_buttons_sink = fn;
+  __asm__ volatile("dmb ish" : : : "memory");
+  s_buttons_sink_ctx = ctx;
+}
+
+extern "C" void sm6125_buttons_notify_sink(uint32_t mask)
+{
+  void (*fn)(void *, uint32_t) = s_buttons_sink;
+  void *ctx = s_buttons_sink_ctx;
+  if (fn && ctx) {
+    fn(ctx, mask);
   }
 }
 
@@ -209,6 +228,30 @@ class Sm6125HidInput : public IOHIDDevice {
       return kIOReturnSuccess;
     }
     self->touchSend();
+    return kIOReturnSuccess;
+  }
+
+  static void buttonsNotify(void *context, uint32_t mask)
+  {
+    Sm6125HidInput *self = static_cast<Sm6125HidInput *>(context);
+    if (self && self->inputLoop) {
+      self->inputLoop->runAction(&Sm6125HidInput::buttonsAction, self,
+                                 reinterpret_cast<void *>(static_cast<uintptr_t>(mask)));
+    }
+  }
+
+  static IOReturn buttonsAction(OSObject *owner, void *mask_arg, void *, void *, void *)
+  {
+    Sm6125HidInput *self = OSDynamicCast(Sm6125HidInput, owner);
+    if (!self || !self->hasEventDriverCached()) {
+      return kIOReturnSuccess;
+    }
+    uint8_t report[2] = {2u, static_cast<uint8_t>(reinterpret_cast<uintptr_t>(mask_arg) & 0x0Fu)};
+    IOBufferMemoryDescriptor *buffer = IOBufferMemoryDescriptor::withBytes(report, sizeof(report), kIODirectionNone);
+    if (buffer) {
+      (void)self->handleReport(buffer, 0, 0);
+      OSSafeReleaseNULL(buffer);
+    }
     return kIOReturnSuccess;
   }
 
@@ -383,6 +426,7 @@ public:
       return false;
     }
     sm6125_touch_set_sink(&Sm6125HidInput::touchNotify, this);
+    sm6125_buttons_set_sink(&Sm6125HidInput::buttonsNotify, this);
     sm6125_hid_diag[0] = 1u;
     timer->setTimeoutMS(500);
     return true;
@@ -391,6 +435,7 @@ public:
   void stop(IOService *provider) override
   {
     sm6125_touch_set_sink(nullptr, nullptr);
+    sm6125_buttons_set_sink(nullptr, nullptr);
     if (timer) {
       timer->cancelTimeout();
       inputLoop->removeEventSource(timer);
