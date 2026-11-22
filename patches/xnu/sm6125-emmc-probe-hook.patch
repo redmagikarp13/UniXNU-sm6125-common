@@ -45,27 +45,52 @@
  #error Owner image-set metadata is an offline development instrument
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7016,6 +7016,52 @@
+@@ -7016,6 +7016,80 @@
   *		word width of the kernel. Once the self-exec completes, the
   *		initproc might be different.
   */
 +#include <kern/thread_call.h>
 +#include <kern/clock.h>
++uint32_t sm6125_skip_setup_files = 0;
++int sm6125_skip_setup_err = 0;
 +struct sm6125_ps_ctx {
-+	char buf[320];
-+	size_t len;
++	char key_buf[160];
++	size_t key_len;
++	char tail_buf[192];
++	size_t tail_len;
 +	uint32_t count;
 +};
++static int
++sm6125_is_key_proc(const char *comm)
++{
++	static const char *const keys[] = {
++		"backboardd", "SpringBoard", "lsd", "PurpleBuddy",
++		"securityd", "mobileactiv", "keybagd", "com.apple.datam",
++	};
++	for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
++		if (strncmp(comm, keys[i], strlen(keys[i])) == 0) {
++			return 1;
++		}
++	}
++	return 0;
++}
 +static int
 +sm6125_ps_visit(proc_t pr, void *arg)
 +{
 +	struct sm6125_ps_ctx *c = (struct sm6125_ps_ctx *)arg;
++	char *dst = c->tail_buf;
++	size_t *dlen = &c->tail_len, cap = sizeof(c->tail_buf);
 +	c->count++;
-+	if (c->len + 28u < sizeof(c->buf)) {
-+		int n = snprintf(c->buf + c->len, sizeof(c->buf) - c->len, "%s%d:%s",
-+		    c->len ? " " : "", proc_pid(pr), pr->p_comm);
++	if (sm6125_is_key_proc(pr->p_comm)) {
++		dst = c->key_buf;
++		dlen = &c->key_len;
++		cap = sizeof(c->key_buf);
++	}
++	if (*dlen + 24u < cap) {
++		int n = snprintf(dst + *dlen, cap - *dlen, "%s%d:%s",
++		    *dlen ? " " : "", proc_pid(pr), pr->p_comm);
 +		if (n > 0) {
-+			c->len += (size_t)n;
++			*dlen += (size_t)n;
 +		}
 +	}
 +	return PROC_RETURNED;
@@ -77,9 +102,12 @@
 +	    uint32_t delay_s, uint32_t proc_count, const char *ps_summary);
 +	uint32_t delay_s = (uint32_t)(uintptr_t)param0;
 +	struct sm6125_ps_ctx ctx;
++	char out[356];
 +	memset(&ctx, 0, sizeof(ctx));
 +	proc_iterate(PROC_ALLPROCLIST, sm6125_ps_visit, &ctx, NULL, NULL);
-+	sm6125_emmc_dump_userspace_probe(delay_s, ctx.count, ctx.buf);
++	snprintf(out, sizeof(out), "%s%s%s", ctx.key_buf,
++	    (ctx.key_len && ctx.tail_len) ? " | " : "", ctx.tail_buf);
++	sm6125_emmc_dump_userspace_probe(delay_s, ctx.count, out);
 +}
 +#undef XNU_OWNER_CACHE_MOUNT
 +#define XNU_OWNER_CACHE_MOUNT 1
@@ -98,7 +126,7 @@
  #if defined(XNU_OWNER_CACHE_MOUNT) && XNU_OWNER_CACHE_MOUNT
  #if !DEVELOPMENT && !DEBUG
  #error The offline owner cache mount is a development instrument
-@@ -7175,6 +7189,24 @@ native_owner_cache_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
+@@ -7175,6 +7249,24 @@ native_owner_cache_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
  	native_owner_cache_authorized = cache_authorized;
  	native_owner_cache_status = error;
  	native_owner_cache_checkpoint(error, cache_authorized);
@@ -123,7 +151,7 @@
  	return error;
  }
  #endif
-@@ -8044,5 +8108,169 @@ done:
+@@ -8044,5 +8136,376 @@ done:
  	if (data_root) vnode_put(data_root);
  	native_owner_data_status = error;
 +	{
@@ -149,6 +177,44 @@
 +					"<key>com.apple.accessoryupdaterd</key><true/>"
 +					"<key>com.apple.identityservicesd</key><true/>"
 +					"<key>com.apple.CommCenter</key><true/>"
++					"<key>com.apple.locationd</key><true/>"
++					"<key>com.apple.photoanalysisd</key><true/>"
++					"<key>com.apple.mediaanalysisd</key><true/>"
++					"<key>com.apple.mediastream.mstreamd</key><true/>"
++					"<key>com.apple.icloud.searchpartyd</key><true/>"
++					"<key>com.apple.findmy.findmybeaconingd</key><true/>"
++					"<key>com.apple.familycircled</key><true/>"
++					"<key>com.apple.financed</key><true/>"
++					"<key>com.apple.softwareupdateservicesd</key><true/>"
++					"<key>com.apple.ndoagent</key><true/>"
++					"<key>com.apple.biomesyncd</key><true/>"
++					"<key>com.apple.email.maild</key><true/>"
++					"<key>com.apple.amsengagementd</key><true/>"
++					"<key>com.apple.adid</key><true/>"
++					"<key>com.apple.eyereliefd</key><true/>"
++					"<key>com.apple.passd</key><true/>"
++					"<key>com.apple.mobile.obliteration</key><true/>"
++					"<key>com.apple.coreduetd</key><true/>"
++					"<key>com.apple.PerfPowerServices</key><true/>"
++					"<key>com.apple.PerfPowerServicesExtended</key><true/>"
++					"<key>com.apple.perfpowermetricd</key><true/>"
++					"<key>com.apple.siriinferenced</key><true/>"
++					"<key>com.apple.siriknowledged</key><true/>"
++					"<key>com.apple.siriactionsd</key><true/>"
++					"<key>com.apple.duetexpertd</key><true/>"
++					"<key>com.apple.modelcatalogd</key><true/>"
++					"<key>com.apple.cameracaptured</key><true/>"
++					"<key>com.apple.findmy.findmylocated</key><true/>"
++					"<key>com.apple.nearbyd</key><true/>"
++					"<key>com.apple.dataaccess.dataaccessd</key><true/>"
++					"<key>com.apple.CallHistorySyncHelper</key><true/>"
++					"<key>com.apple.AddressBook.ABDatabaseDoctor</key><true/>"
++					"<key>com.apple.betaenrollmentd</key><true/>"
++					"<key>com.apple.wifianalyticsd</key><true/>"
++					"<key>com.apple.tailspind</key><true/>"
++					"<key>com.apple.tvremoted</key><true/>"
++					"<key>com.apple.parsecd</key><true/>"
++					"<key>com.apple.attributionkitd</key><true/>"
 +					"</dict></plist>\n";
 +				vfs_context_t ctx = vfs_context_current();
 +				for (unsigned d = 0; d < 2u && vfs_err == 0; ++d) {
@@ -206,6 +272,175 @@
 +				}
 +				if (vfs_err != 0) {
 +					panic("sm6125 launchd watchdog policy failed: %d", vfs_err);
++				}
++				uint32_t skip_setup = 0;
++				if (PE_parse_boot_argn("sm6125-skip-setup", &skip_setup, sizeof(skip_setup)) &&
++				    skip_setup == 1u) {
++					static const struct {
++						const char *path;
++						int mobile_own;
++					} kSkipDirs[] = {
++						{"/private/var/mobile", 1},
++						{"/private/var/mobile/Library", 1},
++						{"/private/var/mobile/Library/Preferences", 1},
++						{"/private/var/root", 0},
++						{"/private/var/root/Library", 0},
++						{"/private/var/root/Library/Preferences", 0},
++						{"/private/var/containers", 0},
++						{"/private/var/containers/Bundle", 0},
++						{"/private/var/containers/Data", 0},
++						{"/private/var/containers/Data/System", 0},
++						{"/private/var/containers/Shared", 0},
++						{"/private/var/containers/Shared/SystemGroup", 0},
++						{"/private/var/containers/Temp", 0},
++					};
++					for (size_t di = 0; di < sizeof(kSkipDirs) / sizeof(kSkipDirs[0]); ++di) {
++						struct mkdir_args dmreq = {.path = scratch + 0xc00, .mode = 0755};
++						int32_t dmres = 0;
++						int derr = copyout(kSkipDirs[di].path, dmreq.path, strlen(kSkipDirs[di].path) + 1u);
++						if (derr == 0) {
++							int merr = mkdir(p, &dmreq, &dmres);
++							if (merr == 0 && kSkipDirs[di].mobile_own) {
++								vnode_t dvp = NULLVP;
++								if (vnode_lookup(kSkipDirs[di].path, 0, &dvp, ctx) == 0) {
++									struct vnode_attr dva;
++									VATTR_INIT(&dva);
++									VATTR_SET(&dva, va_uid, 501);
++									VATTR_SET(&dva, va_gid, 501);
++									(void)vnode_setattr(dvp, &dva, ctx);
++									vnode_put(dvp);
++								}
++							} else if (merr != 0 && merr != EEXIST && sm6125_skip_setup_err == 0) {
++								sm6125_skip_setup_err = merr;
++							}
++						} else if (sm6125_skip_setup_err == 0) {
++							sm6125_skip_setup_err = derr;
++						}
++					}
++					static const char kMigrationXml[] =
++						"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++						"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++						"<plist version=\"1.0\"><dict>\n"
++						"<key>LastSystemVersion</key><string>21H461</string>\n"
++						"<key>DMUserDataDisposition</key><dict><key>SyntheticDidUpgrade</key><false/><key>buildVersion</key><string>21H461</string></dict>\n"
++						"</dict></plist>\n";
++					static const char kSpringboardXml[] =
++						"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++						"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++						"<plist version=\"1.0\"><dict>\n"
++						"<key>BKNoWatchdogs</key><true/>\n"
++						"<key>FBLaunchWatchdogExceptions</key><dict><key>com.apple.purplebuddy</key><real>100.0</real></dict>\n"
++						"<key>MCForceShowCloudConfigurationUI</key><false/>\n"
++						"<key>SBDisableAutoDim</key><true/>\n"
++						"<key>SBDontDimOrLockOnAC</key><true/>\n"
++						"<key>SBDisableIdleSleep</key><true/>\n"
++						"</dict></plist>\n";
++					static const char kPurpleBuddyXml[] =
++						"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++						"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++						"<plist version=\"1.0\"><dict>\n"
++						"<key>SetupDone</key><true/>\n"
++						"<key>SetupFinishedAllSteps</key><true/>\n"
++						"<key>SetupVersion</key><integer>11</integer>\n"
++						"<key>daemonizeNeedsToRun</key><false/>\n"
++						"</dict></plist>\n";
++					static const char kPurpleBuddyNbXml[] =
++						"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++						"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++						"<plist version=\"1.0\"><dict>\n"
++						"<key>ShouldRunDiagnosticsMiniBuddy</key><false/>\n"
++						"<key>ShouldRunHSA2MiniBuddy</key><false/>\n"
++						"<key>ShouldRunKeychainSyncMiniBuddy</key><false/>\n"
++						"<key>ShouldRunMesaMiniBuddy</key><false/>\n"
++						"<key>ShouldRunPaymentMiniBuddy</key><false/>\n"
++						"<key>ShouldRunStandardMiniBuddy</key><false/>\n"
++						"<key>SilentICDPUpgrade</key><false/>\n"
++						"</dict></plist>\n";
++					static const char kManagedCfgNbXml[] =
++						"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++						"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++						"<plist version=\"1.0\"><dict>\n"
++						"<key>LockdownActivationIndicatesCloudConfigurationAvailable</key><false/>\n"
++						"</dict></plist>\n";
++					static const char kFbPrefsXml[] =
++						"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++						"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++						"<plist version=\"1.0\"><dict>\n"
++						"<key>CAEnableDeepFramebuffer</key><false/>\n"
++						"<key>CAEnableFramebufferCompression</key><false/>\n"
++						"<key>CAEnableIOSurfaceCompression</key><false/>\n"
++						"</dict></plist>\n";
++					static const struct {
++						const char *path;
++						const char *body;
++						int len;
++						int mode;
++						uid_t uid;
++						gid_t gid;
++					} kSkipFiles[] = {
++						{"/private/var/mobile/Library/Preferences/com.apple.migration.plist", kMigrationXml, (int)sizeof(kMigrationXml) - 1, 0600, 501, 501},
++						{"/private/var/mobile/Library/Preferences/com.apple.springboard.plist", kSpringboardXml, (int)sizeof(kSpringboardXml) - 1, 0600, 501, 501},
++						{"/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist", kPurpleBuddyXml, (int)sizeof(kPurpleBuddyXml) - 1, 0600, 501, 501},
++						{"/private/var/mobile/Library/Preferences/com.apple.purplebuddy.notbackedup.plist", kPurpleBuddyNbXml, (int)sizeof(kPurpleBuddyNbXml) - 1, 0600, 501, 501},
++						{"/private/var/mobile/Library/Preferences/com.apple.managedconfiguration.notbackedup.plist", kManagedCfgNbXml, (int)sizeof(kManagedCfgNbXml) - 1, 0600, 501, 501},
++						{"/private/var/mobile/Library/Preferences/backboardd.plist", kFbPrefsXml, (int)sizeof(kFbPrefsXml) - 1, 0644, 501, 501},
++						{"/private/var/mobile/Library/Preferences/.GlobalPreferences.plist", kFbPrefsXml, (int)sizeof(kFbPrefsXml) - 1, 0644, 501, 501},
++						{"/private/var/root/Library/Preferences/backboardd.plist", kFbPrefsXml, (int)sizeof(kFbPrefsXml) - 1, 0644, 0, 0},
++						{"/private/var/root/Library/Preferences/.GlobalPreferences.plist", kFbPrefsXml, (int)sizeof(kFbPrefsXml) - 1, 0644, 0, 0},
++					};
++					for (size_t fi = 0; fi < sizeof(kSkipFiles) / sizeof(kSkipFiles[0]); ++fi) {
++						vnode_t fvp = NULLVP;
++						int ferr = vnode_open(kSkipFiles[fi].path,
++						    O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, kSkipFiles[fi].mode, 0, &fvp, ctx);
++						if (ferr == 0 && kSkipFiles[fi].len > 0) {
++							int fres = 0;
++							ferr = vn_rdwr(UIO_WRITE, fvp, (caddr_t)(uintptr_t)kSkipFiles[fi].body,
++							    kSkipFiles[fi].len, 0, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT,
++							    vfs_context_ucred(ctx), &fres, vfs_context_proc(ctx));
++							if (ferr == 0 && fres != 0) {
++								ferr = EIO;
++							}
++						}
++						if (ferr == 0) {
++							struct vnode_attr fva;
++							VATTR_INIT(&fva);
++							VATTR_SET(&fva, va_mode, kSkipFiles[fi].mode);
++							VATTR_SET(&fva, va_uid, kSkipFiles[fi].uid);
++							VATTR_SET(&fva, va_gid, kSkipFiles[fi].gid);
++							VATTR_SET(&fva, va_data_size, (uint64_t)kSkipFiles[fi].len);
++							ferr = vnode_setattr(fvp, &fva, ctx);
++						}
++						if (ferr == 0) {
++							ferr = VNOP_FSYNC(fvp, MNT_WAIT, ctx);
++						}
++						if (fvp != NULLVP) {
++							int fcerr = vnode_close(fvp, FWRITE, ctx);
++							if (ferr == 0) {
++								ferr = fcerr;
++							}
++						}
++						if (ferr == 0) {
++							sm6125_skip_setup_files++;
++						} else if (sm6125_skip_setup_err == 0) {
++							sm6125_skip_setup_err = ferr;
++						}
++					}
++					static const char *const kGestaltCaches[] = {
++						"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
++						"/private/var/mobile/Library/Preferences/com.apple.MobileGestalt.plist",
++						"/private/var/mobile/Library/Preferences/com.apple.mobilegestalt.plist",
++					};
++					for (size_t gi = 0; gi < sizeof(kGestaltCaches) / sizeof(kGestaltCaches[0]); ++gi) {
++						struct unlink_args ureq = {.path = scratch + 0xc00};
++						int32_t ures = 0;
++						int uerr = copyout(kGestaltCaches[gi], ureq.path, strlen(kGestaltCaches[gi]) + 1u);
++						if (uerr == 0) {
++							uerr = unlink(p, &ureq, &ures);
++						}
++						if (uerr != 0 && uerr != ENOENT && sm6125_skip_setup_err == 0) {
++							sm6125_skip_setup_err = uerr;
++						}
++					}
 +				}
 +				uint32_t probe_secs = 0;
 +				if (PE_parse_boot_argn("sm6125-userspace-probe", &probe_secs, sizeof(probe_secs)) &&

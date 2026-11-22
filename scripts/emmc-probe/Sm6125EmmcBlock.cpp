@@ -15,6 +15,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <IOKit/storage/IOMedia.h>
+#include <IOKit/storage/IOStorageDeviceCharacteristics.h>
 #include <kern/clock.h>
 #include <kern/task.h>
 #include <libkern/c++/OSBoolean.h>
@@ -451,6 +452,14 @@ public:
     snprintf(productName_, sizeof(productName_), "SM6125 eMMC %s", windowName_);
     setName(productName_);
     setProperty("SM6125Window", windowName_);
+    OSDictionary *characteristics = OSDictionary::withCapacity(1);
+    OSString *medium = OSString::withCString(kIOPropertyMediumTypeSolidStateKey);
+    if (characteristics && medium &&
+        characteristics->setObject(kIOPropertyMediumTypeKey, medium)) {
+      setProperty(kIOPropertyDeviceCharacteristicsKey, characteristics);
+    }
+    OSSafeReleaseNULL(medium);
+    OSSafeReleaseNULL(characteristics);
     return true;
   }
 
@@ -1904,6 +1913,20 @@ extern "C" void sm6125_emmc_block_late_init(void) {
           vfs_err, prev_boot, cur_boot, readback_ok, errs, vr_errs);
   }
 
+  extern "C" volatile uint32_t sm6125_disp_diag[10] __attribute__((weak));
+  extern "C" volatile uint32_t native_legacy_swapstat[16] __attribute__((weak));
+  extern "C" volatile uint32_t sm6125_aks_diag[4] __attribute__((weak));
+  extern "C" volatile uint32_t armcpu_smp_requested __attribute__((weak));
+  extern "C" volatile uint32_t armcpu_smp_running __attribute__((weak));
+  extern "C" volatile uint32_t armcpu_smp_step[8] __attribute__((weak));
+  extern "C" volatile int32_t armcpu_smp_psci_rc[8] __attribute__((weak));
+  extern "C" volatile uint32_t armcpu_core_timer[8] __attribute__((weak));
+  extern "C" volatile uint32_t armcpu_core_sgi[8] __attribute__((weak));
+  extern "C" uint32_t cs_text_fixup_parsed __attribute__((weak));
+  extern "C" uint32_t cs_text_fixup_applied __attribute__((weak));
+  extern "C" uint32_t sm6125_skip_setup_files __attribute__((weak));
+  extern "C" int sm6125_skip_setup_err __attribute__((weak));
+
   extern "C" void sm6125_emmc_dump_userspace_probe(
       uint32_t delay_s, uint32_t proc_count, const char *ps_summary) {
     Sm6125SharedEmmcCtrl *ctrl = g_shared_ctrl;
@@ -1917,12 +1940,53 @@ extern "C" void sm6125_emmc_block_late_init(void) {
     const uint64_t data_wr =
         __atomic_load_n(&native_data_io_writes, __ATOMIC_RELAXED);
     const unsigned gpt_ok = ctrl ? native_ufs_store_gpt_check() : 0u;
+    const uint32_t d_st = &sm6125_disp_diag ? sm6125_disp_diag[0] : 0u;
+    const uint32_t d_cli = &sm6125_disp_diag ? sm6125_disp_diag[1] : 0u;
+    const uint32_t d_clirc = &sm6125_disp_diag ? sm6125_disp_diag[2] : 0u;
+    const uint32_t d_vok = &sm6125_disp_diag ? sm6125_disp_diag[3] : 0u;
+    const uint32_t d_vfail = &sm6125_disp_diag ? sm6125_disp_diag[4] : 0u;
+    const uint32_t d_vrsn = &sm6125_disp_diag ? sm6125_disp_diag[5] : 0u;
+    const uint32_t d_tx = &sm6125_disp_diag ? sm6125_disp_diag[6] : 0u;
+    const uint32_t d_txrc = &sm6125_disp_diag ? sm6125_disp_diag[7] : 0u;
+    const uint32_t d_ret = &sm6125_disp_diag ? sm6125_disp_diag[8] : 0u;
+    const uint32_t d_vs = &sm6125_disp_diag ? sm6125_disp_diag[9] : 0u;
+    const uint32_t d_kick = &native_legacy_swapstat ? native_legacy_swapstat[1] : 0u;
+    const uint32_t a_st = &sm6125_aks_diag ? sm6125_aks_diag[0] : 0u;
+    const uint32_t a_op = &sm6125_aks_diag ? sm6125_aks_diag[1] : 0u;
+    const uint32_t a_c = &sm6125_aks_diag ? sm6125_aks_diag[2] : 0u;
+    const uint32_t a_ref = &sm6125_aks_diag ? sm6125_aks_diag[3] : 0u;
+    const uint32_t fx_parsed = &cs_text_fixup_parsed ? cs_text_fixup_parsed : 0u;
+    const uint32_t fx_applied = &cs_text_fixup_applied ? cs_text_fixup_applied : 0u;
+    const uint32_t sk_files = &sm6125_skip_setup_files ? sm6125_skip_setup_files : 0u;
+    const int sk_err = &sm6125_skip_setup_err ? sm6125_skip_setup_err : 0;
+    const uint32_t s_req = &armcpu_smp_requested ? armcpu_smp_requested : 0u;
+    const uint32_t s_run = &armcpu_smp_running ? armcpu_smp_running : 0u;
+    uint32_t st[8] = {}, tmr[8] = {}, sgi[8] = {};
+    int32_t rc[8] = {};
+    for (unsigned i = 0; i < 8; ++i) {
+      st[i] = &armcpu_smp_step ? armcpu_smp_step[i] : 0u;
+      rc[i] = &armcpu_smp_psci_rc ? armcpu_smp_psci_rc[i] : 0;
+      tmr[i] = &armcpu_core_timer ? armcpu_core_timer[i] : 0u;
+      sgi[i] = &armcpu_core_sgi ? armcpu_core_sgi[i] : 0u;
+    }
     panic("SM6125-USERSPACE-PROBE t=%us procs=%u\n"
+          "SMP %u/%u st=%x,%x,%x,%x,%x,%x,%x,%x rc=%d,%d,%d,%d,%d,%d,%d\n"
+          "TMR %u,%u,%u,%u,%u,%u,%u,%u SGI %u,%u,%u,%u,%u,%u,%u,%u\n"
           "EMMC rd=%llu wr=%llu sec=%llu fl=%llu gpt=%u\n"
           "DATA rd=%llu wr=%llu st=%u p_err=%llu\n"
+          "DISP st=%u cli=%u/%x val=%u/%u(r=%u) k=%u tx=%u/%x ret=%u vs=%u\n"
+          "AKS st=%u op=%u c=%u ref=%u FX=%u/%u SK=%u/%d\n"
           "PS %s",
-          delay_s, proc_count, emmc_rd, emmc_wr, emmc_sec, emmc_fl, gpt_ok,
+          delay_s, proc_count,
+          s_run, s_req,
+          st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7],
+          rc[1], rc[2], rc[3], rc[4], rc[5], rc[6], rc[7],
+          tmr[0], tmr[1], tmr[2], tmr[3], tmr[4], tmr[5], tmr[6], tmr[7],
+          sgi[0], sgi[1], sgi[2], sgi[3], sgi[4], sgi[5], sgi[6], sgi[7],
+          emmc_rd, emmc_wr, emmc_sec, emmc_fl, gpt_ok,
           data_rd, data_wr, native_data_persist_state,
           native_data_persist_errors,
+          d_st, d_cli, d_clirc, d_vok, d_vfail, d_vrsn, d_kick, d_tx, d_txrc, d_ret, d_vs,
+          a_st, a_op, a_c, a_ref, fx_parsed, fx_applied, sk_files, sk_err,
           (ps_summary && ps_summary[0]) ? ps_summary : "none");
   }

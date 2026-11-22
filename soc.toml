@@ -19,4 +19,8 @@ archives = [
   "build-libpthread-kernel.py",
   "build-sm6125-platform-power.py",
   "build-sm6125-emmc-probe.py",
+  "build-sm6125-legacy-display.py",
 ]
+
+[os_overrides."ipados-17.7.11-21H461".kernel.embedded_components]
+AppleKeyStoreState = "build-sm6125-legacy-display.py"
