@@ -285,8 +285,13 @@ class Sm6125KernelConfigTests(unittest.TestCase):
         names = {name for _, name in addrs}
         self.assertIn('_sm6125_emmc_probe_run', names)
         self.assertIn('_sm6125_touch_probe_run', names)
+        self.assertIn('_sm6125_hid_input_allocate', names)
         self.assertIn('_geni_spi_init', names)
+        self.assertIn('_sm6125_geni_fifo_transfer', names)
         self.assertIn('_sm6125_nvt_identify', names)
+        self.assertIn('_sm6125_nvt_download_firmware', names)
+        self.assertIn('_sm6125_nvt_read_points', names)
+        self.assertIn('_sm6125_touch_fw_size', names)
         self.assertIn('_sm6125_emmc_ident_gpt_run', names)
         self.assertIn('_sm6125_emmc_fast_bench_run', names)
         self.assertIn('_sm6125_emmc_ctrl_init', names)

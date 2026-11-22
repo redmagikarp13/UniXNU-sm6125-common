@@ -1,16 +1,39 @@
 // SPDX-License-Identifier: MIT
 // Sonda em estagios (desligada por padrao) para QUPv3 SE2 SPI + Novatek NT36672A no SM6125 (ginkgo).
+#include "Sm6125GeniFifo.h"
 #include "Sm6125NvtProbe.h"
 #include "Sm6125TouchBoard.h"
 extern "C" {
 #include "GeniSpi.h"
+extern const uint8_t sm6125_touch_fw_data[];
+extern const uint32_t sm6125_touch_fw_size;
+extern const char sm6125_touch_fw_name[];
 }
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOService.h>
+#include <kern/thread.h>
+#include <libkern/c++/OSMetaClass.h>
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
+
+extern "C" {
+void __GLOBAL__sub_I_Sm6125HidInput_cpp(void) __asm("__GLOBAL__sub_I_Sm6125HidInput.cpp");
+IOService *sm6125_hid_input_allocate(void);
+kern_return_t OSKextLoadKextWithIdentifier(const char *identifier);
+void sm6125_touch_notify_sink(void);
+extern volatile uint32_t sm6125_touch_seq;
+extern volatile uint32_t sm6125_touch_count;
+extern volatile uint32_t sm6125_touch_hid_reports;
+extern volatile uint32_t sm6125_touch_max_x;
+extern volatile uint32_t sm6125_touch_max_y;
+extern volatile int sm6125_touch_xs[12];
+extern volatile int sm6125_touch_ys[12];
+extern volatile int sm6125_touch_ids[12];
+extern volatile uint32_t sm6125_hid_diag[8];
+}
 
 extern "C" {
 
@@ -31,6 +54,8 @@ __attribute__((noinline)) static void touch_mmio_write32(uintptr_t base, uint32_
 }  // extern "C"
 
 namespace {
+
+static uint8_t s_nvt_scratch[SM6125_NVT_CHUNK_LEN + 8u];
 
 struct MappedWindow {
   IODeviceMemory *mem = nullptr;
@@ -151,12 +176,38 @@ struct TouchProbeState {
   uint8_t mode_id[5][6];
   uint32_t mode_win;
   sm6125_nvt_ident_result_t nvt;
+
+  uint32_t dl_attempted;
+  sm6125_nvt_dl_diag_t dl;
+  uint32_t last_err_len;
+  int32_t last_err_rc;
+  sm6125_nvt_fw_info_t fw_info;
+  uint32_t irq_rise;
+  uint32_t irq_fall;
+  uint32_t pkt_reads;
+  uint32_t pkt_ok;
+  uint32_t pkt_bad;
+  uint32_t contacts;
+  uint32_t max_fingers;
+  int32_t first_x;
+  int32_t first_y;
+  int32_t last_x;
+  int32_t last_y;
+  int32_t min_x;
+  int32_t max_x;
+  int32_t min_y;
+  int32_t max_y;
+  uint8_t first_pkt[12];
 };
 
 int traced_xfer(void *ctx, const uint8_t *tx, uint8_t *rx, size_t len)
 {
   auto *s = static_cast<TouchProbeState *>(ctx);
-  int rc = geni_spi_transfer(&s->spi, tx, rx, len, 0);
+  int rc = sm6125_geni_fifo_transfer(&s->spi, tx, rx, len, 0);
+  if (rc != 0) {
+    s->last_err_len = static_cast<uint32_t>(len);
+    s->last_err_rc = rc;
+  }
   if (s->trace_capture && (rx != nullptr || rc != 0) && s->trace_n < 6u) {
     unsigned idx = s->trace_n++;
     s->trace_len[idx] = static_cast<uint32_t>(len);
@@ -303,6 +354,10 @@ bool enable_clocks_and_pins(
     s->pin1_spi[i] = touch_mmio_read32(spi_pins_va, i * SM6125_GPIO_STRIDE);
   }
 
+  /* Configura GPIO 88 (touch IRQ) como entrada com pull-up 8mA (ts_int_active no stock-fdt.dts:9237). */
+  const uint32_t irq_cfg = sm6125_tlmm_pin_cfg(SM6125_FUNC_GPIO, SM6125_DRIVE_8MA, SM6125_PULL_UP, 0u);
+  touch_mmio_write32(touch_pins_va, SM6125_GPIO_STRIDE, irq_cfg);
+
   if (do_reset == 1u) {
     const uint32_t rst_cfg = sm6125_tlmm_pin_cfg(SM6125_FUNC_GPIO, SM6125_DRIVE_8MA, SM6125_PULL_UP, 1u);
     touch_mmio_write32(touch_pins_va, 4u, 0u);
@@ -315,6 +370,199 @@ bool enable_clocks_and_pins(
     s->rst_applied = 1u;
   }
   return true;
+}
+
+bool configure_spi_clock(TouchProbeState *s, uint32_t target_hz)
+{
+  struct sm6125_clock_choice choice = {};
+  if (sm6125_choose_clock(s->dfs_hz, s->num_levels, s->spi.oversampling, target_hz, &choice)) {
+    return false;
+  }
+  if (geni_spi_set_clock(&s->spi, target_hz, static_cast<unsigned>(choice.sclk_hz), choice.level)) {
+    return false;
+  }
+  s->sel_level = choice.level;
+  s->sel_div = choice.div;
+  s->sel_sclk_hz = choice.sclk_hz;
+  s->sel_actual_hz = choice.actual_hz;
+  return true;
+}
+
+static uintptr_t s_fb_va = 0;
+
+void fb_paint_band(uint32_t y0, uint32_t y1, uint32_t color)
+{
+  uintptr_t base = s_fb_va;
+  uint32_t rb = static_cast<uint32_t>(PE_state.video.v_rowBytes);
+  uint32_t w = static_cast<uint32_t>(PE_state.video.v_width);
+  uint32_t h = static_cast<uint32_t>(PE_state.video.v_height);
+  if (!base || !rb || !w || !h || y0 >= h) {
+    return;
+  }
+  if (y1 > h) y1 = h;
+  for (uint32_t r = y0; r < y1; ++r) {
+    volatile uint32_t *row = reinterpret_cast<volatile uint32_t *>(base + static_cast<uintptr_t>(r) * rb);
+    for (uint32_t c = 0; c < w; ++c) {
+      row[c] = color;
+    }
+  }
+  __asm__ volatile("dsb sy" : : : "memory");
+}
+
+void fb_paint_dot(int32_t cx, int32_t cy, uint32_t color)
+{
+  uintptr_t base = s_fb_va;
+  uint32_t rb = static_cast<uint32_t>(PE_state.video.v_rowBytes);
+  int32_t w = static_cast<int32_t>(PE_state.video.v_width);
+  int32_t h = static_cast<int32_t>(PE_state.video.v_height);
+  if (!base || !rb || w <= 0 || h <= 0) {
+    return;
+  }
+  int32_t y0 = (cy - 10 > h / 4) ? (cy - 10) : (h / 4);
+  int32_t y1 = (cy + 10 < h) ? (cy + 10) : (h - 1);
+  int32_t x0 = (cx - 10 >= 0) ? (cx - 10) : 0;
+  int32_t x1 = (cx + 10 < w) ? (cx + 10) : (w - 1);
+  for (int32_t r = y0; r <= y1; ++r) {
+    volatile uint32_t *row = reinterpret_cast<volatile uint32_t *>(base + static_cast<uintptr_t>(r) * rb);
+    for (int32_t c = x0; c <= x1; ++c) {
+      row[c] = color;
+    }
+  }
+  __asm__ volatile("dsb sy" : : : "memory");
+}
+
+void capture_points_loop(
+    const sm6125_nvt_bus_t *bus,
+    uintptr_t touch_pins_va,
+    uint32_t duration_ms,
+    TouchProbeState *s)
+{
+  uint16_t max_x = s->fw_info.abs_x_max ? s->fw_info.abs_x_max : 1080u;
+  uint16_t max_y = s->fw_info.abs_y_max ? s->fw_info.abs_y_max : 2340u;
+
+  /* Aguarda calibracao de baseline (RESET_STATE_REK 0xA1 -> 0xA2/0xA3, nt36xxx.c:2478) ate 400 ms */
+  for (unsigned retry = 0; retry < 40u; ++retry) {
+    uint8_t st[2] = {0};
+    if (sm6125_nvt_read(bus, SM6125_NVT_EVENT_BUF_ADDR + SM6125_NVT_EVENT_RESET_COMPLETE, st, sizeof(st)) == 0) {
+      if (st[0] >= SM6125_NVT_RESET_STATE_INIT && st[0] <= SM6125_NVT_RESET_STATE_MAX) {
+        s->dl.reset_state[0] = st[0];
+      }
+      if (st[0] >= 0xA2u && st[0] <= SM6125_NVT_RESET_STATE_MAX) {
+        break;
+      }
+    }
+    delay_ms_spin(nullptr, 10u);
+  }
+  (void)sm6125_nvt_set_page(bus, SM6125_NVT_EVENT_BUF_ADDR);
+
+  /* Faixa AMARELA (banda 2) avisa visualmente na tela: "TOQUE E DESLIZE AGORA!" */
+  uint32_t h = static_cast<uint32_t>(PE_state.video.v_height);
+  if (h >= 16u) {
+    fb_paint_band(h / 8u, (h * 3u) / 16u, 0xFFFFFF00u);
+  }
+
+  /* Poll de GPIO 88 a cada 100 us (10 kHz) para nao perder pulsos curtos de IRQ_TYPE_EDGE_RISING */
+  uint32_t ticks = duration_ms * 10u;
+  if (!ticks) ticks = 1u;
+
+  uint32_t prev_lvl = touch_mmio_read32(touch_pins_va, SM6125_GPIO_STRIDE + 4u) & 1u;
+  uint32_t printed = 0;
+  int prev_down = 0;
+  int banner_green = 0;
+  int have_any_pkt = 0;
+  int32_t prev_x = -1, prev_y = -1;
+  uint32_t quiet_after_touch_ticks = 0;
+
+  for (uint32_t t = 0; t < ticks; ++t) {
+    IODelay(100u);
+    uint32_t lvl = touch_mmio_read32(touch_pins_va, SM6125_GPIO_STRIDE + 4u) & 1u;
+    int rising = 0;
+    if (lvl != prev_lvl) {
+      if (lvl) {
+        s->irq_rise++;
+        rising = 1;
+      } else {
+        s->irq_fall++;
+      }
+      prev_lvl = lvl;
+    }
+
+    /* Leitura de 67 bytes somente em borda de subida do GPIO 88 (ou fallback suave a cada 25 ms = 250 ticks) */
+    if (!rising && (t % 250u) != 0u) {
+      if (s->contacts >= 12u && !prev_down) {
+        quiet_after_touch_ticks++;
+        if (quiet_after_touch_ticks >= 4000u) { /* 400 ms apos soltar o dedo com >= 12 amostras */
+          break;
+        }
+      }
+      continue;
+    }
+
+    uint8_t raw[SM6125_NVT_POINT_DATA_LEN];
+    sm6125_nvt_points_t pts;
+    int r = sm6125_nvt_read_points(bus, max_x, max_y, raw, &pts);
+    s->pkt_reads++;
+    if (!have_any_pkt) {
+      memcpy(s->first_pkt, raw, sizeof(s->first_pkt));
+      have_any_pkt = 1;
+    }
+    if (r || !pts.csum_ok || pts.recovery) {
+      s->pkt_bad++;
+      continue;
+    }
+    s->pkt_ok++;
+    if (pts.count == 0u) {
+      if (prev_down && printed < 24u) {
+        printf("SM6125-TOUCH: UP (%d,%d)\n", prev_x, prev_y);
+        printed++;
+      }
+      prev_down = 0;
+      continue;
+    }
+
+    quiet_after_touch_ticks = 0;
+    if (!banner_green && h >= 16u) {
+      fb_paint_band(h / 8u, (h * 3u) / 16u, 0xFF00FF00u);
+      banner_green = 1;
+    }
+
+    if (pts.count > s->max_fingers) {
+      s->max_fingers = pts.count;
+    }
+    if (s->contacts == 0u) {
+      memcpy(s->first_pkt, raw, sizeof(s->first_pkt));
+      s->first_x = pts.fingers[0].x;
+      s->first_y = pts.fingers[0].y;
+    }
+    for (uint32_t k = 0; k < pts.count; ++k) {
+      int32_t x = pts.fingers[k].x;
+      int32_t y = pts.fingers[k].y;
+      if (s->min_x < 0 || x < s->min_x) s->min_x = x;
+      if (x > s->max_x) s->max_x = x;
+      if (s->min_y < 0 || y < s->min_y) s->min_y = y;
+      if (y > s->max_y) s->max_y = y;
+      fb_paint_dot(x, y, 0xFF00FF00u);
+    }
+    s->contacts += pts.count;
+    s->last_x = pts.fingers[0].x;
+    s->last_y = pts.fingers[0].y;
+
+    int dx = prev_down ? (s->last_x - prev_x) : 999;
+    int dy = prev_down ? (s->last_y - prev_y) : 999;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    if (!prev_down || dx >= 25 || dy >= 25) {
+      if (printed < 24u) {
+        printf("SM6125-TOUCH: n=%u id=%u (%d,%d) w=%u p=%u\n",
+               pts.count, pts.fingers[0].id, s->last_x, s->last_y,
+               pts.fingers[0].w, pts.fingers[0].p);
+        printed++;
+      }
+      prev_x = s->last_x;
+      prev_y = s->last_y;
+    }
+    prev_down = 1;
+  }
 }
 
 void format_bytes(char *dst, size_t cap, const uint8_t *src, unsigned n)
@@ -332,12 +580,13 @@ void format_bytes(char *dst, size_t cap, const uint8_t *src, unsigned n)
 
 __attribute__((noreturn)) void report_and_panic(const TouchProbeState &s)
 {
-  char loop_hex[20], id_hex[16], old_hex[16];
+  char loop_hex[20], id_hex[16], alt_hex[16], pkt_hex[28];
   char xf_str[3][32];
   char m_hex[5][16];
   format_bytes(loop_hex, sizeof(loop_hex), s.loop_rx, 8u);
   format_bytes(id_hex, sizeof(id_hex), s.nvt.id, 6u);
-  format_bytes(old_hex, sizeof(old_hex), s.nvt.alt_id, 6u);
+  format_bytes(alt_hex, sizeof(alt_hex), s.nvt.alt_id, 6u);
+  format_bytes(pkt_hex, sizeof(pkt_hex), s.first_pkt, 12u);
 
   for (unsigned i = 0; i < 3u; ++i) {
     if (i < s.trace_n) {
@@ -359,7 +608,36 @@ __attribute__((noreturn)) void report_and_panic(const TouchProbeState &s)
     }
   }
 
-  panic(
+  static char s_panic_buf[1024];
+
+  if (s.dl_attempted) {
+    snprintf(
+        s_panic_buf, sizeof(s_panic_buf),
+        "SM6125-TOUCH-PROBE st=%u/%u step=%u err=%d fw=%u\n"
+        "GENI p=%u ifd=%d L=%u d=%u a=%uK LOOP ok=%u\n"
+        "NVT ok=%d %s md=%u ad=%x id=%s\n"
+        "DL ok=%d try=%u st=%u rc=%d flg=%02x i=%08x d=%08x\n"
+        "XF n=%u rc=%d iq=%08x gs=%08x tx=%08x rx=%08x\n"
+        "FW v=%02x/%02x pid=%04x %ux%u ch=%ux%u rst=%02x\n"
+        "TCH irq=%u/%u rd=%u ok=%u/%u cnt=%u mf=%u\n"
+        "XY first=%d,%d last=%d,%d box=%d..%d,%d..%d\n"
+        "PKT %s",
+        s.stage_done, s.stage_req, s.step, s.err, sm6125_touch_fw_size,
+        s.spi.info.protocol, s.spi.info.fifo_disabled,
+        s.sel_level, s.sel_div, static_cast<unsigned>(s.sel_actual_hz / 1000ULL), s.loop_ok,
+        s.nvt.matched, s.nvt.chip_name ? s.nvt.chip_name : "-", s.mode_win, s.nvt.addr_used, id_hex,
+        s.dl.ok, s.dl.attempt, s.dl.stage, s.dl.last_rc, s.dl.crc_flags, s.dl.r_ilm_crc, s.dl.r_dlm_crc,
+        s.last_err_len, s.last_err_rc, s.spi.snap_irq, s.spi.snap_status, s.spi.snap_txfs, s.spi.snap_rxfs,
+        s.fw_info.fw_ver, s.fw_info.fw_ver_bar, s.fw_info.pid,
+        s.fw_info.abs_x_max, s.fw_info.abs_y_max, s.fw_info.x_num, s.fw_info.y_num, s.dl.reset_state[0],
+        s.irq_rise, s.irq_fall, s.pkt_reads, s.pkt_ok, s.pkt_bad, s.contacts, s.max_fingers,
+        s.first_x, s.first_y, s.last_x, s.last_y, s.min_x, s.max_x, s.min_y, s.max_y,
+        pkt_hex);
+    panic("%s", s_panic_buf);
+  }
+
+  snprintf(
+      s_panic_buf, sizeof(s_panic_buf),
       "SM6125-TOUCH-PROBE st=%u/%u step=%u err=%d\n"
       "GCC v0=%08x v1=%08x g0=%08x df=%08x c=%08x f=%08x\n"
       "CBCR m=%08x s=%08x c=%08x c2=%08x s2=%08x\n"
@@ -368,7 +646,7 @@ __attribute__((noreturn)) void report_and_panic(const TouchProbeState &s)
       "PIN1 %03x %03x %03x %03x rst=%u\n"
       "GENI q=%08x fw=%08x p=%u ifd=%d hw0=%08x gs=%08x\n"
       "CLK L=%u d=%u s=%uM a=%uK LOOP rc=%d ok=%u %s\n"
-      "NVT ok=%d %s md=%u ad=%x id=%s old=%s\n"
+      "NVT ok=%d %s md=%u ad=%x id=%s alt=%s\n"
       "XF %s %s %s\n"
       "M %u:%s %u:%s %u:%s %u:%s %u:%s",
       s.stage_done, s.stage_req, s.step, s.err,
@@ -390,13 +668,288 @@ __attribute__((noreturn)) void report_and_panic(const TouchProbeState &s)
       s.sel_level, s.sel_div, static_cast<unsigned>(s.sel_sclk_hz / 1000000ULL),
       static_cast<unsigned>(s.sel_actual_hz / 1000ULL),
       s.loop_rc, s.loop_ok, loop_hex,
-      s.nvt.matched, s.nvt.chip_name ? s.nvt.chip_name : "-", s.mode_win, s.nvt.addr_used, id_hex, old_hex,
+      s.nvt.matched, s.nvt.chip_name ? s.nvt.chip_name : "-", s.mode_win, s.nvt.addr_used, id_hex, alt_hex,
       xf_str[0], xf_str[1], xf_str[2],
       s.mode_val[0], m_hex[0], s.mode_val[1], m_hex[1], s.mode_val[2], m_hex[2],
       s.mode_val[3], m_hex[3], s.mode_val[4], m_hex[4]);
+  panic("%s", s_panic_buf);
 }
 
 }  // namespace
+
+static void sleep_ms_yield(void *, unsigned ms)
+{
+  IOSleep(ms ? ms : 1u);
+}
+
+static void publish_touch_points(const sm6125_nvt_points_t &pts)
+{
+  uint32_t cnt = pts.count;
+  if (cnt > SM6125_NVT_MAX_FINGERS) cnt = SM6125_NVT_MAX_FINGERS;
+
+  uint32_t seq = sm6125_touch_seq;
+  sm6125_touch_seq = (seq + 1u) | 1u;
+  __asm__ volatile("dmb ish" : : : "memory");
+  sm6125_touch_count = cnt;
+  for (uint32_t i = 0; i < cnt; ++i) {
+    sm6125_touch_ids[i] = static_cast<int>(pts.fingers[i].id);
+    sm6125_touch_xs[i] = static_cast<int>(pts.fingers[i].x);
+    sm6125_touch_ys[i] = static_cast<int>(pts.fingers[i].y);
+  }
+  __asm__ volatile("dmb ish" : : : "memory");
+  sm6125_touch_seq = (seq + 2u) & ~1u;
+  __asm__ volatile("dmb ish" : : : "memory");
+  sm6125_touch_notify_sink();
+}
+
+static volatile uint32_t s_hid_stage = 0;
+static volatile int32_t s_hid_rc = 0;
+
+static bool register_sm6125_hid_service(void)
+{
+  s_hid_stage = 10;
+  for (unsigned i = 0; i < 200u; ++i) {
+    if (IOService::getResourceService() != nullptr) {
+      break;
+    }
+    IOSleep(50u);
+  }
+  IOService *parent = IOService::getResourceService();
+  if (!parent) {
+    s_hid_stage = 91;
+    IOLog("Sm6125TouchHID: resource service unavailable\n");
+    return false;
+  }
+
+  s_hid_stage = 11;
+  kern_return_t ks = OSKextLoadKextWithIdentifier("com.apple.iokit.IOHIDFamily");
+  if (ks != KERN_SUCCESS) {
+    s_hid_stage = 92;
+    s_hid_rc = ks;
+    IOLog("Sm6125TouchHID: IOHIDFamily load failed (%d)\n", ks);
+    return false;
+  }
+  (void)OSKextLoadKextWithIdentifier("com.apple.iokit.IOHIDEventDriver");
+
+  s_hid_stage = 12;
+  void *meta_handle = OSMetaClass::preModLoad("com.apple.iokit.IOHIDFamily");
+  if (!meta_handle) {
+    s_hid_stage = 93;
+    IOLog("Sm6125TouchHID: preModLoad failed\n");
+    return false;
+  }
+  __GLOBAL__sub_I_Sm6125HidInput_cpp();
+  OSReturn post_rc = OSMetaClass::postModLoad(meta_handle);
+  if (post_rc != kOSReturnSuccess) {
+    s_hid_stage = 94;
+    s_hid_rc = post_rc;
+    IOLog("Sm6125TouchHID: postModLoad failed (%d)\n", post_rc);
+    return false;
+  }
+
+  s_hid_stage = 13;
+  IOService *nub = new IOService;
+  IOService *hid = sm6125_hid_input_allocate();
+  if (!nub || !hid || !nub->init() || !hid->init()) {
+    OSSafeReleaseNULL(hid);
+    OSSafeReleaseNULL(nub);
+    s_hid_stage = 95;
+    IOLog("Sm6125TouchHID: allocate/init failed\n");
+    return false;
+  }
+
+  nub->setName("Sm6125TouchSPI");
+  if (!nub->attach(parent) || !nub->start(parent)) {
+    nub->detach(parent);
+    OSSafeReleaseNULL(hid);
+    OSSafeReleaseNULL(nub);
+    s_hid_stage = 96;
+    IOLog("Sm6125TouchHID: nub start failed\n");
+    return false;
+  }
+
+  if (!hid->attach(nub) || !hid->start(nub)) {
+    hid->detach(nub);
+    nub->stop(parent);
+    nub->detach(parent);
+    OSSafeReleaseNULL(hid);
+    OSSafeReleaseNULL(nub);
+    s_hid_stage = 97;
+    IOLog("Sm6125TouchHID: hid start failed\n");
+    return false;
+  }
+
+  hid->registerService();
+  s_hid_stage = 20;
+  IOLog("Sm6125TouchHID: registered Sm6125HidInput service=%p\n", hid);
+  return true;
+}
+
+static void sm6125_touch_hid_thread(void *, wait_result_t)
+{
+  uint32_t diag_secs = 0;
+  PE_parse_boot_argn("sm6125-touch-diag", &diag_secs, sizeof(diag_secs));
+
+  if (sm6125_touch_fw_size == 0u) {
+    s_hid_stage = 1;
+    IOLog("Sm6125TouchHID: no firmware embedded\n");
+    return;
+  }
+
+  TouchProbeState s;
+  memset(&s, 0, sizeof(s));
+  s.stage_req = 5u;
+
+  MappedWindow gpll0, gpll6, qup0, vote, spi_pins, touch_pins, wrapper, se;
+  if (!map_window(SM6125_GCC_BASE + 0x0000u, 0x1000u, &gpll0) ||
+      !map_window(SM6125_GCC_BASE + 0x6000u, 0x1000u, &gpll6) ||
+      !map_window(SM6125_GCC_BASE + 0x1f000u, 0x1000u, &qup0) ||
+      !map_window(SM6125_GCC_BASE + 0x79000u, 0x1000u, &vote) ||
+      !map_window(SM6125_TLMM_WEST_BASE + sm6125_tlmm_ctl(SM6125_GPIO_SPI_MISO), 4u * SM6125_GPIO_STRIDE, &spi_pins) ||
+      !map_window(SM6125_TLMM_WEST_BASE + sm6125_tlmm_ctl(SM6125_GPIO_TOUCH_RST), 2u * SM6125_GPIO_STRIDE, &touch_pins) ||
+      !map_window(SM6125_QUP0_WRAPPER_BASE, SM6125_QUP0_WRAPPER_SIZE, &wrapper) ||
+      !map_window(SM6125_QUP0_SE2_BASE, SM6125_QUP0_SE2_SIZE, &se)) {
+    s_hid_stage = 2;
+    IOLog("Sm6125TouchHID: map_window failed\n");
+    return;
+  }
+
+  take_snapshot(gpll0.va, gpll6.va, qup0.va, vote.va, spi_pins.va, touch_pins.va, &s);
+  if (!enable_clocks_and_pins(gpll0.va, gpll6.va, qup0.va, vote.va, spi_pins.va, touch_pins.va, 0u, &s)) {
+    s_hid_stage = 3;
+    IOLog("Sm6125TouchHID: clocks/pins failed\n");
+    return;
+  }
+
+  s.spi.wrapper = (struct geni_io){reinterpret_cast<void *>(wrapper.va), io_rd, io_wr, io_delay_us};
+  s.spi.se = (struct geni_io){reinterpret_cast<void *>(se.va), io_rd, io_wr, io_delay_us};
+  s.spi.poll_only = 1;
+  s.spi.poll_limit = 200000u;
+
+  if (geni_spi_init(&s.spi) != 0 || !configure_spi_clock(&s, SM6125_SPI_DEFAULT_HZ)) {
+    s_hid_stage = 4;
+    IOLog("Sm6125TouchHID: GENI SPI init failed\n");
+    return;
+  }
+
+  const sm6125_nvt_bus_t bus = {&s, traced_xfer, sleep_ms_yield};
+  geni_spi_setup(&s.spi, 0u, 0u);
+  if (sm6125_nvt_identify(&bus, &s.nvt) != 0) {
+    s_hid_stage = 5;
+    IOLog("Sm6125TouchHID: NT36672A identify failed\n");
+    return;
+  }
+
+  (void)configure_spi_clock(&s, SM6125_SPI_MAX_HZ);
+  sm6125_nvt_fw_t fw;
+  if (sm6125_nvt_fw_parse(sm6125_touch_fw_data, sm6125_touch_fw_size, &fw) != 0 ||
+      sm6125_nvt_download_firmware(&bus, &fw, s_nvt_scratch, &s.dl) != 0 ||
+      sm6125_nvt_get_fw_info(&bus, &s.fw_info) != 0) {
+    s_hid_stage = 6;
+    IOLog("Sm6125TouchHID: firmware load failed\n");
+    return;
+  }
+
+  for (unsigned retry = 0; retry < 40u; ++retry) {
+    uint8_t st[2] = {0};
+    if (sm6125_nvt_read(&bus, SM6125_NVT_EVENT_BUF_ADDR + SM6125_NVT_EVENT_RESET_COMPLETE, st, sizeof(st)) == 0 &&
+        st[0] >= 0xA2u && st[0] <= SM6125_NVT_RESET_STATE_MAX) {
+      break;
+    }
+    IOSleep(10u);
+  }
+  (void)sm6125_nvt_set_page(&bus, SM6125_NVT_EVENT_BUF_ADDR);
+
+  uint16_t max_x = s.fw_info.abs_x_max ? s.fw_info.abs_x_max : 1080u;
+  uint16_t max_y = s.fw_info.abs_y_max ? s.fw_info.abs_y_max : 2340u;
+  sm6125_touch_max_x = max_x;
+  sm6125_touch_max_y = max_y;
+
+  if (!register_sm6125_hid_service()) {
+    if (diag_secs) {
+      IOSleep(diag_secs * 1000u);
+      panic("SM6125-HID-DIAG st=%u rc=%d hid=%u/%u/%u/%x",
+            s_hid_stage, s_hid_rc,
+            sm6125_hid_diag[0], sm6125_hid_diag[1], sm6125_hid_diag[2], sm6125_hid_diag[3]);
+    }
+    return;
+  }
+
+  IOLog("Sm6125TouchHID: ready %ux%u fw=0x%02x pid=0x%04x\n",
+        max_x, max_y, s.fw_info.fw_ver, s.fw_info.pid);
+
+  uint32_t prev_lvl = touch_mmio_read32(touch_pins.va, SM6125_GPIO_STRIDE + 4u) & 1u;
+  uint32_t prev_down_cnt = 0u;
+  uint32_t idle_ticks = 0u;
+  uint32_t rec_streak = 0u;
+  uint32_t total_ticks = 0u;
+  uint32_t rd_ok = 0u, rd_bad = 0u, rd_rec = 0u, contacts = 0u;
+  uint8_t bad_pkt[8] = {};
+  int have_bad = 0;
+
+  for (;;) {
+    IOSleep(1u);
+    total_ticks++;
+    if (diag_secs && total_ticks >= diag_secs * 1000u) {
+      panic("SM6125-HID-DIAG st=%u rc=%d hid=%u/%u/%u/%x ed=%u/%u op=%x pu=%x rep=%u irq=%u rd=%u ok=%u bad=%u rec=%u cnt=%u xy=%d,%d",
+            s_hid_stage, s_hid_rc,
+            sm6125_hid_diag[0], sm6125_hid_diag[1], sm6125_hid_diag[2], sm6125_hid_diag[3],
+            sm6125_hid_diag[4], sm6125_hid_diag[5], sm6125_hid_diag[6], sm6125_hid_diag[7],
+            sm6125_touch_hid_reports, s.irq_rise, s.pkt_reads, rd_ok, rd_bad, rd_rec, contacts,
+            s.last_x, s.last_y);
+    }
+
+    uint32_t lvl = touch_mmio_read32(touch_pins.va, SM6125_GPIO_STRIDE + 4u) & 1u;
+    bool rising = (lvl != prev_lvl) && (lvl != 0u);
+    prev_lvl = lvl;
+    if (rising) s.irq_rise++;
+
+    if (!rising) {
+      idle_ticks++;
+      if (!prev_down_cnt || idle_ticks < 200u) {
+        continue;
+      }
+    }
+    idle_ticks = 0u;
+
+    uint8_t raw[SM6125_NVT_POINT_DATA_LEN];
+    sm6125_nvt_points_t pts;
+    int r = sm6125_nvt_read_points_fast(&bus, max_x, max_y, raw, &pts);
+    s.pkt_reads++;
+    if (r != 0) {
+      rd_bad++;
+      continue;
+    }
+    if (pts.recovery) {
+      rd_rec++;
+      rec_streak++;
+      if (!have_bad) { memcpy(bad_pkt, raw, sizeof(bad_pkt)); have_bad = 1; }
+      if (rec_streak >= 10u) {
+        rec_streak = 0u;
+        if (sm6125_nvt_download_firmware(&bus, &fw, s_nvt_scratch, &s.dl) == 0) {
+          (void)sm6125_nvt_set_page(&bus, SM6125_NVT_EVENT_BUF_ADDR);
+        }
+      }
+      continue;
+    }
+    rec_streak = 0u;
+    if (!pts.csum_ok) {
+      rd_bad++;
+      if (!have_bad) { memcpy(bad_pkt, raw, sizeof(bad_pkt)); have_bad = 1; }
+      continue;
+    }
+    rd_ok++;
+    if (pts.count > 0u) {
+      contacts += pts.count;
+      s.last_x = pts.fingers[0].x;
+      s.last_y = pts.fingers[0].y;
+    }
+    if (pts.count > 0u || prev_down_cnt > 0u) {
+      publish_touch_points(pts);
+      prev_down_cnt = pts.count;
+    }
+  }
+}
 
 extern "C" void sm6125_touch_probe_run(void)
 {
@@ -405,23 +958,50 @@ extern "C" void sm6125_touch_probe_run(void)
     return;
   }
 
+  if (stage_req == 5u) {
+    thread_t th = THREAD_NULL;
+    if (kernel_thread_start(sm6125_touch_hid_thread, nullptr, &th) == KERN_SUCCESS && th != THREAD_NULL) {
+      thread_deallocate(th);
+    }
+    return;
+  }
+
   uint32_t target_hz = SM6125_SPI_DEFAULT_HZ;
+  uint32_t dl_hz = SM6125_SPI_MAX_HZ;
   uint32_t do_reset = 0u;
   uint32_t forced_mode = 0xFFu;
-  PE_parse_boot_argn("sm6125-touch-hz", &target_hz, sizeof(target_hz));
-  if (target_hz < SM6125_SPI_MIN_HZ || target_hz > SM6125_SPI_MAX_HZ) {
-    target_hz = SM6125_SPI_DEFAULT_HZ;
+  uint32_t duration_ms = 20000u;
+  if (PE_parse_boot_argn("sm6125-touch-hz", &target_hz, sizeof(target_hz))) {
+    if (target_hz < SM6125_SPI_MIN_HZ || target_hz > SM6125_SPI_MAX_HZ) {
+      target_hz = SM6125_SPI_DEFAULT_HZ;
+    }
+    dl_hz = target_hz;
   }
   PE_parse_boot_argn("sm6125-touch-rst", &do_reset, sizeof(do_reset));
   PE_parse_boot_argn("sm6125-touch-mode", &forced_mode, sizeof(forced_mode));
+  PE_parse_boot_argn("sm6125-touch-ms", &duration_ms, sizeof(duration_ms));
+  if (duration_ms > 30000u) duration_ms = 30000u;
 
   TouchProbeState s;
   memset(&s, 0, sizeof(s));
   s.stage_req = stage_req;
   s.loop_rc = 99;
   s.nvt.chip_name = "-";
+  s.first_x = s.first_y = s.last_x = s.last_y = -1;
+  s.min_x = s.max_x = s.min_y = s.max_y = -1;
 
-  MappedWindow gpll0, gpll6, qup0, vote, spi_pins, touch_pins, wrapper, se;
+  MappedWindow gpll0, gpll6, qup0, vote, spi_pins, touch_pins, wrapper, se, fb;
+  s_fb_va = 0;
+  if (PE_state.video.v_baseAddr && PE_state.video.v_rowBytes && PE_state.video.v_height) {
+    if (PE_state.video.v_baseAddr >= 0xFFFF000000000000ULL) {
+      s_fb_va = static_cast<uintptr_t>(PE_state.video.v_baseAddr);
+    } else {
+      uint64_t fb_sz = static_cast<uint64_t>(PE_state.video.v_rowBytes) * PE_state.video.v_height;
+      if (map_window(PE_state.video.v_baseAddr, fb_sz, &fb)) {
+        s_fb_va = fb.va;
+      }
+    }
+  }
   bool mapped_base =
       map_window(SM6125_GCC_BASE + 0x0000u, 0x1000u, &gpll0) &&
       map_window(SM6125_GCC_BASE + 0x6000u, 0x1000u, &gpll6) &&
@@ -483,43 +1063,35 @@ extern "C" void sm6125_touch_probe_run(void)
     }
 
     s.step = 5u;
-    struct sm6125_clock_choice choice = {};
-    if (sm6125_choose_clock(s.dfs_hz, s.num_levels, s.spi.oversampling, target_hz, &choice)) {
+    if (!configure_spi_clock(&s, target_hz)) {
       s.err = -22;
-      goto out;
-    }
-    s.sel_level = choice.level;
-    s.sel_div = choice.div;
-    s.sel_sclk_hz = choice.sclk_hz;
-    s.sel_actual_hz = choice.actual_hz;
-
-    r = geni_spi_set_clock(&s.spi, target_hz, static_cast<unsigned>(choice.sclk_hz), choice.level);
-    if (r) {
-      s.err = r;
       goto out;
     }
 
     s.step = 6u;
-    static const uint8_t kLoopPat[16] = {
-      0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-      0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
-    };
-    uint8_t loop_rx[16] = {};
+    uint8_t loop_tx[128] = {};
+    uint8_t loop_rx[128] = {};
+    for (unsigned k = 0; k < 128u; ++k) {
+      loop_tx[k] = (k < 15u) ? static_cast<uint8_t>((k + 1u) * 0x11u)
+                             : static_cast<uint8_t>((k * 0x1Du + 0x5Au) & 0xFFu);
+    }
     geni_spi_setup(&s.spi, GENI_SPI_LOOP, 0u);
-    s.loop_rc = geni_spi_transfer(&s.spi, kLoopPat, loop_rx, sizeof(kLoopPat), 0);
+    s.loop_rc = sm6125_geni_fifo_transfer(&s.spi, loop_tx, loop_rx, sizeof(loop_tx), 0);
     for (unsigned k = 0; k < 8u; ++k) {
       s.loop_rx[k] = loop_rx[k];
     }
     if (s.loop_rc == 0) {
-      for (unsigned k = 0; k < 16u; ++k) {
-        if (loop_rx[k] == kLoopPat[k]) {
+      for (unsigned k = 0; k < 128u; ++k) {
+        if (loop_rx[k] == loop_tx[k]) {
           s.loop_ok++;
         }
       }
     }
     geni_spi_setup(&s.spi, 0u, 0u);
-    if (s.loop_rc != 0 || s.loop_ok != 16u) {
-      s.err = s.loop_rc ? s.loop_rc : -5;
+    if (s.loop_rc != 0 || s.loop_ok != 128u) {
+      s.last_err_len = sizeof(loop_tx);
+      s.last_err_rc = s.loop_rc ? s.loop_rc : -5;
+      s.err = s.last_err_rc;
       goto out;
     }
 
@@ -547,13 +1119,59 @@ extern "C" void sm6125_touch_probe_run(void)
         s.mode_win = m;
         s.stage_done = 3u;
         s.err = 0;
-        goto out;
+        break;
       }
     }
-    s.err = SM6125_NVT_ERR_CHIP;
+    if (!s.nvt.matched) {
+      s.err = SM6125_NVT_ERR_CHIP;
+      goto out;
+    }
+    if (stage_req < 4u) {
+      goto out;
+    }
+
+    s.step = 8u;
+    s.dl_attempted = 1u;
+    s.trace_capture = 0u;
+    if (sm6125_touch_fw_size == 0u) {
+      s.err = SM6125_NVT_ERR_FW;
+      goto out;
+    }
+    (void)configure_spi_clock(&s, dl_hz);
+
+    sm6125_nvt_fw_t fw;
+    r = sm6125_nvt_fw_parse(sm6125_touch_fw_data, sm6125_touch_fw_size, &fw);
+    if (r) {
+      s.err = r;
+      goto out;
+    }
+    r = sm6125_nvt_download_firmware(&bus, &fw, s_nvt_scratch, &s.dl);
+    if (r) {
+      s.err = r;
+      goto out;
+    }
+
+    s.step = 9u;
+    r = sm6125_nvt_get_fw_info(&bus, &s.fw_info);
+    if (r) {
+      s.err = r;
+      goto out;
+    }
+
+    printf("SM6125-TOUCH: FW OK (%s) v=%02x pid=%04x %ux%u (%ux%u) - TOQUE NA TELA AGORA (%us)\n",
+           sm6125_touch_fw_name, s.fw_info.fw_ver, s.fw_info.pid,
+           s.fw_info.abs_x_max, s.fw_info.abs_y_max,
+           s.fw_info.x_num, s.fw_info.y_num, duration_ms / 1000u);
+
+    s.step = 10u;
+    capture_points_loop(&bus, touch_pins.va, duration_ms, &s);
+    s.stage_done = 4u;
+    s.err = 0;
   }
 
 out:
+  s_fb_va = 0;
+  unmap_window(&fb);
   unmap_window(&se);
   unmap_window(&wrapper);
   unmap_window(&touch_pins);
