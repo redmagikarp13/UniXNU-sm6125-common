@@ -241,14 +241,17 @@ def replay_compile(record_path: Path, source: Path, obj: Path, extra_flags: list
 def main() -> None:
     script_dir = Path(__file__).resolve().parent
     probe_dir = script_dir / 'touch-probe'
+    gpu_dir = script_dir / 'gpu-probe'
     geni_dir = find_geni_spi_dir()
     geni_src = geni_dir / 'GeniSpi.c'
     fifo_src = probe_dir / 'Sm6125GeniFifo.c'
     nvt_src = probe_dir / 'Sm6125NvtProbe.c'
     btn_src = probe_dir / 'Sm6125Buttons.c'
+    gpu_src = gpu_dir / 'Sm6125GpuProbe.c'
+    rpm_src = gpu_dir / 'Sm6125RpmGlink.c'
     cpp_src = probe_dir / 'Sm6125TouchProbe.cpp'
     hid_src = probe_dir / 'Sm6125HidInput.cpp'
-    for src in (geni_src, fifo_src, nvt_src, btn_src, cpp_src, hid_src):
+    for src in (geni_src, fifo_src, nvt_src, btn_src, gpu_src, rpm_src, cpp_src, hid_src):
         require(src.is_file(), f'Missing source file: {src}')
 
     fw_path = find_touch_fw_bin()
@@ -267,12 +270,14 @@ def main() -> None:
         '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
         '-Wno-unnecessary-virtual-specifier',
     ]
-    inc_flags = ['-I', str(probe_dir), '-I', str(geni_dir), '-I', str(OUT)]
+    inc_flags = ['-I', str(probe_dir), '-I', str(gpu_dir), '-I', str(geni_dir), '-I', str(OUT)]
 
     geni_obj = OUT / 'GeniSpi.o'
     fifo_obj = OUT / 'Sm6125GeniFifo.o'
     nvt_obj = OUT / 'Sm6125NvtProbe.o'
     btn_obj = OUT / 'Sm6125Buttons.o'
+    gpu_obj = OUT / 'Sm6125GpuProbe.o'
+    rpm_obj = OUT / 'Sm6125RpmGlink.o'
     fw_obj = OUT / 'Sm6125TouchFw.o'
     cpp_obj = OUT / 'Sm6125TouchProbe.o'
     hid_obj = OUT / 'Sm6125HidInput.o'
@@ -284,11 +289,13 @@ def main() -> None:
     replay_compile(c_record, fifo_src, fifo_obj, [*common_warnings, *inc_flags])
     replay_compile(c_record, nvt_src, nvt_obj, [*common_warnings, '-I', str(probe_dir)])
     replay_compile(c_record, btn_src, btn_obj, [*common_warnings, '-I', str(probe_dir)])
+    replay_compile(c_record, gpu_src, gpu_obj, [*common_warnings, '-I', str(gpu_dir)])
+    replay_compile(c_record, rpm_src, rpm_obj, [*common_warnings, '-I', str(gpu_dir)])
     replay_compile(c_record, fw_src, fw_obj, common_warnings)
     replay_compile(cpp_record, cpp_src, cpp_obj, [*common_warnings, *inc_flags])
     replay_compile(cpp_record, hid_src, hid_obj, [*common_warnings, *inc_flags])
 
-    for obj in (geni_obj, fifo_obj, nvt_obj, btn_obj, fw_obj, cpp_obj, hid_obj):
+    for obj in (geni_obj, fifo_obj, nvt_obj, btn_obj, gpu_obj, rpm_obj, fw_obj, cpp_obj, hid_obj):
         raw = obj.read_bytes()
         check_object(raw, obj.stem)
         if obj != hid_obj:
@@ -312,7 +319,7 @@ def main() -> None:
         '-c', str(hid_bind_s), '-o', str(hid_bind_obj),
     ], timeout=60)
 
-    objs = [geni_obj, fifo_obj, nvt_obj, btn_obj, fw_obj, cpp_obj, hid_late_obj, hid_bind_obj]
+    objs = [geni_obj, fifo_obj, nvt_obj, btn_obj, gpu_obj, rpm_obj, fw_obj, cpp_obj, hid_late_obj, hid_bind_obj]
 
     archive = OUT / 'libSm6125TouchProbe.a'
     archive.unlink(missing_ok=True)
